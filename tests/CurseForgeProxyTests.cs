@@ -137,6 +137,9 @@ public sealed class CurseForgeProxyTests
         {
             RequestCount++;
 
+            if (responsesQueue.Count == 0)
+                throw new InvalidOperationException("No more queued responses are available.");
+
             return Task.FromResult(responsesQueue.Dequeue());
         }
     }
