@@ -11,8 +11,13 @@ public sealed class CurseForgeEndpoints(EnvironmentConfiguration configuration, 
 {
     public const string HttpClientName = "curseforge-egress";
 
-    private const string CurseForgeHost = "api.curseforge.com";
+    private const string ApiCurseForgeHost = "api.curseforge.com";
+    private const string WwwCurseForgeHost = "www.curseforge.com";
     private const string ApiKeyHeaderName = "x-api-key";
+
+    // Matches /v1/mods/{modId}/files/{fileId}/download
+    private static readonly System.Text.RegularExpressions.Regex FallbackDownloadPathPattern =
+        new(@"^/v1/mods/\d+/files/\d+/download$", System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.Compiled);
 
     private static readonly IPAddress[] CloudFrontAddresses =
     [
@@ -104,7 +109,8 @@ public sealed class CurseForgeEndpoints(EnvironmentConfiguration configuration, 
     private HttpRequestMessage CreateProxyRequest(HttpContext context)
     {
         var request = context.Request;
-        var targetUri = CreateTargetUri(request);
+        var (targetHost, targetPath) = ResolveTarget(request);
+        var targetUri = CreateTargetUri(request, targetPath);
         var proxyRequest = new HttpRequestMessage(new HttpMethod(request.Method), targetUri);
 
         if (CanHaveBody(context))
@@ -112,7 +118,7 @@ public sealed class CurseForgeEndpoints(EnvironmentConfiguration configuration, 
 
         CopyRequestHeaders(request, proxyRequest);
 
-        proxyRequest.Headers.Host = CurseForgeHost;
+        proxyRequest.Headers.Host = targetHost;
         proxyRequest.Headers.ConnectionClose = true;
 
         if (!request.Headers.ContainsKey(ApiKeyHeaderName))
@@ -121,13 +127,23 @@ public sealed class CurseForgeEndpoints(EnvironmentConfiguration configuration, 
         return proxyRequest;
     }
 
-    private static Uri CreateTargetUri(HttpRequest request)
+    private static (string TargetHost, string TargetPath) ResolveTarget(HttpRequest request)
+    {
+        var requestPath = request.Path.HasValue ? request.Path.Value! : "/";
+
+        if (FallbackDownloadPathPattern.IsMatch(requestPath))
+            return (WwwCurseForgeHost, "/api" + requestPath);
+
+        return (ApiCurseForgeHost, requestPath);
+    }
+
+    private static Uri CreateTargetUri(HttpRequest request, string targetPath)
     {
         return new Uri(UriHelper.BuildAbsolute(
             scheme: Uri.UriSchemeHttps,
             host: new HostString(CloudFrontAddresses[0].ToString(), port: 443),
             pathBase: PathString.Empty,
-            path: request.Path.HasValue ? request.Path : new PathString("/"),
+            path: new PathString(targetPath),
             query: request.QueryString));
     }
 
