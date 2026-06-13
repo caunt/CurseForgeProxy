@@ -4,7 +4,7 @@ var builder = WebApplication.CreateBuilder(args);
 
 builder.Logging.SetMinimumLevel(LogLevel.Warning);
 
-builder.Logging.AddFilter(nameof(CurseForgeProxy), LogLevel.Information);
+builder.Logging.AddFilter(nameof(CurseForgeProxy), LogLevel.Debug);
 builder.Logging.AddFilter(nameof(Egress), LogLevel.Debug);
 
 builder.Services.AddSingleton<EnvironmentConfiguration>();
