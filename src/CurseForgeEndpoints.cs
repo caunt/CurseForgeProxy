@@ -1,4 +1,3 @@
-using System.Net;
 using System.Net.Sockets;
 using Microsoft.AspNetCore.Http.Features;
 using Microsoft.AspNetCore.Http.Extensions;
@@ -13,14 +12,6 @@ public sealed class CurseForgeEndpoints(EnvironmentConfiguration configuration, 
 
     private const string CurseForgeHost = "api.curseforge.com";
     private const string ApiKeyHeaderName = "x-api-key";
-
-    private static readonly IPAddress[] CloudFrontAddresses =
-    [
-        IPAddress.Parse("2600:f0f0:601::"), // AWS AMAZON, GLOBAL
-        IPAddress.Parse("2600:f0f0:602::"), // AWS AMAZON, GLOBAL
-        IPAddress.Parse("2600:f0f0:603::"), // AWS AMAZON, GLOBAL
-        IPAddress.Parse("2600:9000:2000::") // CloudFront / AWS global edge range
-    ];
 
     private static readonly HashSet<string> HopByHopHeaders = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -122,7 +113,7 @@ public sealed class CurseForgeEndpoints(EnvironmentConfiguration configuration, 
     {
         return new Uri(UriHelper.BuildAbsolute(
             scheme: Uri.UriSchemeHttps,
-            host: new HostString(CloudFrontAddresses[0].ToString(), port: 443),
+            host: new HostString(CurseForgeHost, port: 443),
             pathBase: PathString.Empty,
             path: request.Path.HasValue ? request.Path : new PathString("/"),
             query: request.QueryString));
