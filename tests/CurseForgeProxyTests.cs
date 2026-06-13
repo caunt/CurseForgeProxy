@@ -56,6 +56,7 @@ public sealed class CurseForgeProxyTests
             Assert.Equal("?gameId=432", handler.Request.RequestUri?.Query);
             Assert.Equal("api.curseforge.com", handler.Request.Headers.Host);
             Assert.True(handler.Request.Headers.Contains("x-api-key"));
+            AssertNoConnectionHeader(handler);
         }
         finally
         {
@@ -95,6 +96,7 @@ public sealed class CurseForgeProxyTests
             Assert.Equal("{}", body);
             Assert.Equal(2, handler.RequestCount);
             AssertDistinctCloudFrontAddresses(handler, expectedCount: 2);
+            AssertNoConnectionHeader(handler);
         }
         finally
         {
@@ -138,6 +140,7 @@ public sealed class CurseForgeProxyTests
             Assert.Equal("forbidden-3", body);
             Assert.Equal(3, handler.RequestCount);
             AssertDistinctCloudFrontAddresses(handler, expectedCount: 3);
+            AssertNoConnectionHeader(handler);
         }
         finally
         {
@@ -174,6 +177,7 @@ public sealed class CurseForgeProxyTests
             Assert.Equal("{}", body);
             Assert.Equal(2, handler.RequestCount);
             AssertDistinctCloudFrontAddresses(handler, expectedCount: 2);
+            AssertNoConnectionHeader(handler);
         }
         finally
         {
@@ -376,17 +380,29 @@ public sealed class CurseForgeProxyTests
     {
         public HttpRequestMessage? Request { get; private set; }
 
+        public bool? RequestConnectionClose { get; private set; }
+
+        public string[] RequestConnectionHeaderValues { get; private set; } = [];
+
         protected override Task<HttpResponseMessage> SendAsync(
             HttpRequestMessage request,
             CancellationToken cancellationToken)
         {
             Request = request;
+            RequestConnectionClose = request.Headers.ConnectionClose;
+            RequestConnectionHeaderValues = GetHeaderValues(request, "Connection");
 
             return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
             {
                 Content = new StringContent("{}")
             });
         }
+    }
+
+    private static void AssertNoConnectionHeader(CapturingHandler handler)
+    {
+        Assert.False(handler.RequestConnectionClose == true);
+        Assert.Empty(handler.RequestConnectionHeaderValues);
     }
 
     private static void AssertDistinctCloudFrontAddresses(SequencedHandler handler, int expectedCount)
@@ -398,6 +414,21 @@ public sealed class CurseForgeProxyTests
                 .Select(uri => uri.Host)
                 .Distinct(StringComparer.OrdinalIgnoreCase)
                 .Count());
+    }
+
+    private static void AssertNoConnectionHeader(SequencedHandler handler)
+    {
+        Assert.Equal(handler.RequestCount, handler.RequestConnectionCloseValues.Count);
+        Assert.Equal(handler.RequestCount, handler.RequestConnectionHeaderValues.Count);
+        Assert.All(handler.RequestConnectionCloseValues, connectionClose => Assert.False(connectionClose == true));
+
+        foreach (var connectionHeaderValues in handler.RequestConnectionHeaderValues)
+            Assert.Empty(connectionHeaderValues);
+    }
+
+    private static string[] GetHeaderValues(HttpRequestMessage request, string headerName)
+    {
+        return request.Headers.TryGetValues(headerName, out var values) ? values.ToArray() : [];
     }
 
     private sealed class SequencedHandler : HttpMessageHandler
@@ -416,6 +447,10 @@ public sealed class CurseForgeProxyTests
 
         public List<Uri> RequestUris { get; } = [];
 
+        public List<bool?> RequestConnectionCloseValues { get; } = [];
+
+        public List<string[]> RequestConnectionHeaderValues { get; } = [];
+
         public int RequestCount { get; private set; }
 
         protected override Task<HttpResponseMessage> SendAsync(
@@ -425,6 +460,9 @@ public sealed class CurseForgeProxyTests
             RequestCount++;
             if (request.RequestUri is not null)
                 RequestUris.Add(request.RequestUri);
+
+            RequestConnectionCloseValues.Add(request.Headers.ConnectionClose);
+            RequestConnectionHeaderValues.Add(GetHeaderValues(request, "Connection"));
 
             if (responsesQueue.Count == 0)
                 throw new InvalidOperationException("No more queued responses are available.");

@@ -192,7 +192,6 @@ public sealed class CurseForgeEndpoints(
         CopyRequestHeaders(request, proxyRequest);
 
         proxyRequest.Headers.Host = targetHost;
-        proxyRequest.Headers.ConnectionClose = true;
 
         if (!request.Headers.ContainsKey(ApiKeyHeaderName))
             proxyRequest.Headers.TryAddWithoutValidation(ApiKeyHeaderName, configuration.CurseForgeApiKey);
