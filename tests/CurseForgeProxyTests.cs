@@ -62,6 +62,44 @@ public sealed class CurseForgeProxyTests
         }
     }
 
+    [Fact]
+    public async Task CurseForgeProxyRetriesForbiddenResponses()
+    {
+        var originalApiKey = Environment.GetEnvironmentVariable("CURSEFORGE_API_KEY");
+        Environment.SetEnvironmentVariable("CURSEFORGE_API_KEY", "test-api-key");
+
+        try
+        {
+            var handler = new SequencedHandler(
+                new HttpResponseMessage(HttpStatusCode.Forbidden)
+                {
+                    Content = new StringContent("forbidden")
+                },
+                new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent("{}")
+                });
+
+            using var factory = new WebApplicationFactory<Program>()
+                .WithWebHostBuilder(builder => builder.ConfigureTestServices(services =>
+                {
+                    services.AddSingleton<IHttpClientFactory>(new CapturingHttpClientFactory(handler));
+                }));
+            using var client = factory.CreateClient();
+
+            using var response = await client.GetAsync("/v1/mods/search");
+            var body = await response.Content.ReadAsStringAsync();
+
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            Assert.Equal("{}", body);
+            Assert.Equal(2, handler.RequestCount);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("CURSEFORGE_API_KEY", originalApiKey);
+        }
+    }
+
     private sealed class CapturingHttpClientFactory(HttpMessageHandler handler) : IHttpClientFactory
     {
         public HttpClient CreateClient(string name)
@@ -84,6 +122,22 @@ public sealed class CurseForgeProxyTests
             {
                 Content = new StringContent("{}")
             });
+        }
+    }
+
+    private sealed class SequencedHandler(params HttpResponseMessage[] responses) : HttpMessageHandler
+    {
+        private readonly Queue<HttpResponseMessage> responsesQueue = new(responses);
+
+        public int RequestCount { get; private set; }
+
+        protected override Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request,
+            CancellationToken cancellationToken)
+        {
+            RequestCount++;
+
+            return Task.FromResult(responsesQueue.Dequeue());
         }
     }
 }

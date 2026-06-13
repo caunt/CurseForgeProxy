@@ -89,6 +89,9 @@ public sealed class CurseForgeEndpoints(EnvironmentConfiguration configuration, 
 
             using (proxyResponse)
             {
+                if (proxyResponse.StatusCode == HttpStatusCode.Forbidden && attempt < maxAttempts)
+                    continue;
+
                 context.Response.StatusCode = (int)proxyResponse.StatusCode;
                 CopyResponseHeaders(context.Response, proxyResponse);
 
