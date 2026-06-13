@@ -10,7 +10,6 @@ public sealed class CurseForgeEndpoints(EnvironmentConfiguration configuration, 
 {
     public const string HttpClientName = "curseforge-egress";
 
-    private const string ProxyPath = "/curseforge";
     private const string CurseForgeHost = "api.curseforge.com";
     private const string ApiKeyHeaderName = "x-api-key";
 
@@ -38,8 +37,8 @@ public sealed class CurseForgeEndpoints(EnvironmentConfiguration configuration, 
 
     public IEndpointRouteBuilder ConfigureRoutes(IEndpointRouteBuilder endpoints)
     {
-        endpoints.Map(pattern: ProxyPath, requestDelegate: ProxyAsync);
-        endpoints.Map(pattern: $"{ProxyPath}/{{**path}}", requestDelegate: ProxyAsync);
+        endpoints.Map(pattern: "/", requestDelegate: ProxyAsync);
+        endpoints.Map(pattern: "/{**path}", requestDelegate: ProxyAsync);
         return endpoints;
     }
 
@@ -88,13 +87,11 @@ public sealed class CurseForgeEndpoints(EnvironmentConfiguration configuration, 
 
     private static Uri CreateTargetUri(HttpRequest request)
     {
-        request.Path.StartsWithSegments(ProxyPath, out var targetPath);
-
         return new Uri(UriHelper.BuildAbsolute(
             scheme: Uri.UriSchemeHttps,
             host: new HostString(CloudFrontAddresses[0].ToString(), port: 443),
             pathBase: PathString.Empty,
-            path: targetPath.HasValue ? targetPath : new PathString("/"),
+            path: request.Path.HasValue ? request.Path : new PathString("/"),
             query: request.QueryString));
     }
 
