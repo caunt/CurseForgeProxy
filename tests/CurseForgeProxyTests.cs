@@ -116,12 +116,77 @@ public sealed class CurseForgeProxyTests
                 }));
             using var client = factory.CreateClient();
 
-            using var response = await client.GetAsync("/v1/mods/123/files/456/download");
+            using var response = await client.GetAsync("/v1/mods/783522/files/7842394/download");
 
             Assert.Equal(HttpStatusCode.OK, response.StatusCode);
             Assert.NotNull(handler.Request);
-            Assert.Equal("/api/v1/mods/123/files/456/download", handler.Request.RequestUri?.AbsolutePath);
+            Assert.Equal("/api/v1/mods/783522/files/7842394/download", handler.Request.RequestUri?.AbsolutePath);
             Assert.Equal("www.curseforge.com", handler.Request.Headers.Host);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("CURSEFORGE_API_KEY", originalApiKey);
+        }
+    }
+
+    [Fact]
+    public async Task CurseForgeProxyPassesThroughRedirectResponses()
+    {
+        var originalApiKey = Environment.GetEnvironmentVariable("CURSEFORGE_API_KEY");
+        Environment.SetEnvironmentVariable("CURSEFORGE_API_KEY", "test-api-key");
+
+        try
+        {
+            var handler = new SequencedHandler(
+                new HttpResponseMessage(HttpStatusCode.Found)
+                {
+                    Headers = { Location = new Uri("https://edge.forgecdn.net/files/mod.jar") },
+                    Content = new StringContent(string.Empty)
+                });
+
+            using var factory = new WebApplicationFactory<Program>()
+                .WithWebHostBuilder(builder => builder.ConfigureTestServices(services =>
+                {
+                    services.AddSingleton<IHttpClientFactory>(new CapturingHttpClientFactory(handler));
+                }));
+            using var client = factory.CreateClient(new WebApplicationFactoryClientOptions
+            {
+                AllowAutoRedirect = false
+            });
+
+            using var response = await client.GetAsync("/v1/mods/783522/files/7842394/download");
+
+            Assert.Equal(HttpStatusCode.Found, response.StatusCode);
+            Assert.Equal("https://edge.forgecdn.net/files/mod.jar", response.Headers.Location?.ToString());
+            Assert.Equal(1, handler.RequestCount);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("CURSEFORGE_API_KEY", originalApiKey);
+        }
+    }
+
+    [Fact]
+    public async Task CurseForgeProxyReturnsGatewayTimeoutForUpstreamTimeout()
+    {
+        var originalApiKey = Environment.GetEnvironmentVariable("CURSEFORGE_API_KEY");
+        Environment.SetEnvironmentVariable("CURSEFORGE_API_KEY", "test-api-key");
+
+        try
+        {
+            var handler = new TimeoutHandler();
+            using var factory = new WebApplicationFactory<Program>()
+                .WithWebHostBuilder(builder => builder.ConfigureTestServices(services =>
+                {
+                    services.AddSingleton<IHttpClientFactory>(new CapturingHttpClientFactory(handler));
+                }));
+            using var client = factory.CreateClient();
+
+            using var response = await client.GetAsync("/v1/mods/search");
+            var body = await response.Content.ReadAsStringAsync();
+
+            Assert.Equal(HttpStatusCode.GatewayTimeout, response.StatusCode);
+            Assert.Equal("Upstream request timed out.", body);
         }
         finally
         {
@@ -259,6 +324,16 @@ public sealed class CurseForgeProxyTests
                 throw new InvalidOperationException("No more queued responses are available.");
 
             return Task.FromResult(responsesQueue.Dequeue());
+        }
+    }
+
+    private sealed class TimeoutHandler : HttpMessageHandler
+    {
+        protected override Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request,
+            CancellationToken cancellationToken)
+        {
+            throw new OperationCanceledException();
         }
     }
 }

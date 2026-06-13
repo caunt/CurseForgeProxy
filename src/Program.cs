@@ -13,7 +13,12 @@ builder.Services
         options.AddressMode = Egress.EgressAddressMode.AssignOnDemand;
     })
     .AddHttpClient(name: CurseForgeEndpoints.HttpClientName)
-    .UseEgressPool();
+    .ConfigurePrimaryHttpMessageHandler(serviceProvider =>
+    {
+        var handler = serviceProvider.GetRequiredService<Egress.EgressPool>().CreateHttpMessageHandler();
+        handler.AllowAutoRedirect = false;
+        return handler;
+    });
 
 var app = builder.Build();
 
