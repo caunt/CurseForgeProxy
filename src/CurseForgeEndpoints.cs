@@ -150,27 +150,42 @@ public sealed class CurseForgeEndpoints(
 
             using (proxyResponse)
             {
-                if (proxyResponse.StatusCode == HttpStatusCode.Forbidden && attempt < maxAttempts)
+                var statusCode = (int)proxyResponse.StatusCode;
+
+                if (proxyResponse.StatusCode == HttpStatusCode.Forbidden)
                 {
-                    logger.LogDebug(
-                        "Retrying upstream request after status {StatusCode} on attempt {Attempt}/{MaxAttempts} to {TargetHost} via {CloudFrontAddress}.",
-                        (int)proxyResponse.StatusCode,
+                    if (attempt < maxAttempts)
+                    {
+                        logger.LogDebug(
+                            "Retrying upstream request after status {StatusCode} on attempt {Attempt}/{MaxAttempts} to {TargetHost} via {CloudFrontAddress}.",
+                            statusCode,
+                            attempt,
+                            maxAttempts,
+                            proxyRequest.Headers.Host,
+                            cloudFrontAddress);
+                        continue;
+                    }
+
+                    logger.LogWarning(
+                        "Upstream request failed after status {StatusCode} on attempt {Attempt}/{MaxAttempts} to {TargetHost} via {CloudFrontAddress}.",
+                        statusCode,
                         attempt,
                         maxAttempts,
                         proxyRequest.Headers.Host,
                         cloudFrontAddress);
-                    continue;
+                }
+                else
+                {
+                    logger.LogTrace(
+                        "Upstream request completed with status {StatusCode} on attempt {Attempt}/{MaxAttempts} to {TargetHost} via {CloudFrontAddress}.",
+                        statusCode,
+                        attempt,
+                        maxAttempts,
+                        proxyRequest.Headers.Host,
+                        cloudFrontAddress);
                 }
 
-                logger.LogTrace(
-                    "Upstream request completed with status {StatusCode} on attempt {Attempt}/{MaxAttempts} to {TargetHost} via {CloudFrontAddress}.",
-                    (int)proxyResponse.StatusCode,
-                    attempt,
-                    maxAttempts,
-                    proxyRequest.Headers.Host,
-                    cloudFrontAddress);
-
-                context.Response.StatusCode = (int)proxyResponse.StatusCode;
+                context.Response.StatusCode = statusCode;
                 CopyResponseHeaders(context.Response, proxyResponse);
 
                 await proxyResponse.Content.CopyToAsync(context.Response.Body, context.RequestAborted);

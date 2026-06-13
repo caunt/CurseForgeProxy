@@ -1,9 +1,11 @@
+using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.AspNetCore.TestHost;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 
 namespace CurseForgeProxy.Tests;
 
@@ -112,6 +114,7 @@ public sealed class CurseForgeProxyTests
 
         try
         {
+            using var loggerProvider = new CapturingLoggerProvider();
             var handler = new SequencedHandler(
                 new HttpResponseMessage(HttpStatusCode.Forbidden)
                 {
@@ -127,10 +130,19 @@ public sealed class CurseForgeProxyTests
                 });
 
             using var factory = new WebApplicationFactory<Program>()
-                .WithWebHostBuilder(builder => builder.ConfigureTestServices(services =>
+                .WithWebHostBuilder(builder =>
                 {
-                    services.AddSingleton<IHttpClientFactory>(new CapturingHttpClientFactory(handler));
-                }));
+                    builder.ConfigureLogging(logging =>
+                    {
+                        logging.ClearProviders();
+                        logging.AddProvider(loggerProvider);
+                    });
+
+                    builder.ConfigureTestServices(services =>
+                    {
+                        services.AddSingleton<IHttpClientFactory>(new CapturingHttpClientFactory(handler));
+                    });
+                });
             using var client = factory.CreateClient();
 
             using var response = await client.GetAsync("/v1/mods/search");
@@ -141,6 +153,10 @@ public sealed class CurseForgeProxyTests
             Assert.Equal(3, handler.RequestCount);
             AssertDistinctCloudFrontAddresses(handler, expectedCount: 3);
             AssertNoConnectionHeader(handler);
+            Assert.Contains(loggerProvider.Entries, entry =>
+                entry.CategoryName == typeof(CurseForgeEndpoints).FullName &&
+                entry.LogLevel == LogLevel.Warning &&
+                entry.Message.Contains("Upstream request failed after status 403 on attempt 3/3", StringComparison.Ordinal));
         }
         finally
         {
@@ -178,6 +194,56 @@ public sealed class CurseForgeProxyTests
             Assert.Equal(2, handler.RequestCount);
             AssertDistinctCloudFrontAddresses(handler, expectedCount: 2);
             AssertNoConnectionHeader(handler);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("CURSEFORGE_API_KEY", originalApiKey);
+        }
+    }
+
+    [Fact]
+    public async Task CurseForgeProxyReturnsGatewayForConnectionFailureAfterMaxRetries()
+    {
+        var originalApiKey = Environment.GetEnvironmentVariable("CURSEFORGE_API_KEY");
+        Environment.SetEnvironmentVariable("CURSEFORGE_API_KEY", "test-api-key");
+
+        try
+        {
+            using var loggerProvider = new CapturingLoggerProvider();
+            var handler = new SequencedHandler(
+                () => throw new SocketException((int)SocketError.ConnectionReset),
+                () => throw new SocketException((int)SocketError.ConnectionReset),
+                () => throw new SocketException((int)SocketError.ConnectionReset));
+
+            using var factory = new WebApplicationFactory<Program>()
+                .WithWebHostBuilder(builder =>
+                {
+                    builder.ConfigureLogging(logging =>
+                    {
+                        logging.ClearProviders();
+                        logging.AddProvider(loggerProvider);
+                    });
+
+                    builder.ConfigureTestServices(services =>
+                    {
+                        services.AddSingleton<IHttpClientFactory>(new CapturingHttpClientFactory(handler));
+                    });
+                });
+            using var client = factory.CreateClient();
+
+            using var response = await client.GetAsync("/v1/mods/search");
+            var body = await response.Content.ReadAsStringAsync();
+
+            Assert.Equal(HttpStatusCode.BadGateway, response.StatusCode);
+            Assert.Equal("Upstream connection was reset.", body);
+            Assert.Equal(3, handler.RequestCount);
+            AssertDistinctCloudFrontAddresses(handler, expectedCount: 3);
+            AssertNoConnectionHeader(handler);
+            Assert.Contains(loggerProvider.Entries, entry =>
+                entry.CategoryName == typeof(CurseForgeEndpoints).FullName &&
+                entry.LogLevel == LogLevel.Warning &&
+                entry.Exception is SocketException &&
+                entry.Message.Contains("Upstream request failed after connection failure on attempt 3/3", StringComparison.Ordinal));
         }
         finally
         {
@@ -470,6 +536,62 @@ public sealed class CurseForgeProxyTests
             return Task.FromResult(responsesQueue.Dequeue()());
         }
     }
+
+    private sealed class CapturingLoggerProvider : ILoggerProvider
+    {
+        private readonly ConcurrentQueue<LogEntry> entries = new();
+
+        public IEnumerable<LogEntry> Entries => entries;
+
+        public ILogger CreateLogger(string categoryName)
+        {
+            return new CapturingLogger(categoryName, entries);
+        }
+
+        public void Dispose()
+        {
+        }
+
+        private sealed class CapturingLogger(
+            string categoryName,
+            ConcurrentQueue<LogEntry> entries) : ILogger
+        {
+            public IDisposable? BeginScope<TState>(TState state) where TState : notnull
+            {
+                return NullScope.Instance;
+            }
+
+            public bool IsEnabled(LogLevel logLevel)
+            {
+                return true;
+            }
+
+            public void Log<TState>(
+                LogLevel logLevel,
+                EventId eventId,
+                TState state,
+                Exception? exception,
+                Func<TState, Exception?, string> formatter)
+            {
+                entries.Enqueue(new LogEntry(categoryName, logLevel, exception, formatter(state, exception)));
+            }
+        }
+
+        private sealed class NullScope : IDisposable
+        {
+            public static readonly NullScope Instance = new();
+
+            public void Dispose()
+            {
+            }
+        }
+    }
+
+    private sealed record LogEntry(
+        string CategoryName,
+        LogLevel LogLevel,
+        Exception? Exception,
+        string Message);
 
     private sealed class TimeoutHandler : HttpMessageHandler
     {
