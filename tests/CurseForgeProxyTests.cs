@@ -100,6 +100,124 @@ public sealed class CurseForgeProxyTests
         }
     }
 
+    [Fact]
+    public async Task CurseForgeProxyForwardsFallbackDownloadToWwwCurseForge()
+    {
+        var originalApiKey = Environment.GetEnvironmentVariable("CURSEFORGE_API_KEY");
+        Environment.SetEnvironmentVariable("CURSEFORGE_API_KEY", "test-api-key");
+
+        try
+        {
+            var handler = new CapturingHandler();
+            using var factory = new WebApplicationFactory<Program>()
+                .WithWebHostBuilder(builder => builder.ConfigureTestServices(services =>
+                {
+                    services.AddSingleton<IHttpClientFactory>(new CapturingHttpClientFactory(handler));
+                }));
+            using var client = factory.CreateClient();
+
+            using var response = await client.GetAsync("/v1/mods/123/files/456/download");
+
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            Assert.NotNull(handler.Request);
+            Assert.Equal("/api/v1/mods/123/files/456/download", handler.Request.RequestUri?.AbsolutePath);
+            Assert.Equal("www.curseforge.com", handler.Request.Headers.Host);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("CURSEFORGE_API_KEY", originalApiKey);
+        }
+    }
+
+    [Fact]
+    public async Task CurseForgeProxyForwardsNonDownloadFilePathToApiCurseForge()
+    {
+        var originalApiKey = Environment.GetEnvironmentVariable("CURSEFORGE_API_KEY");
+        Environment.SetEnvironmentVariable("CURSEFORGE_API_KEY", "test-api-key");
+
+        try
+        {
+            var handler = new CapturingHandler();
+            using var factory = new WebApplicationFactory<Program>()
+                .WithWebHostBuilder(builder => builder.ConfigureTestServices(services =>
+                {
+                    services.AddSingleton<IHttpClientFactory>(new CapturingHttpClientFactory(handler));
+                }));
+            using var client = factory.CreateClient();
+
+            using var response = await client.GetAsync("/v1/mods/123/files/456");
+
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            Assert.NotNull(handler.Request);
+            Assert.Equal("/v1/mods/123/files/456", handler.Request.RequestUri?.AbsolutePath);
+            Assert.Equal("api.curseforge.com", handler.Request.Headers.Host);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("CURSEFORGE_API_KEY", originalApiKey);
+        }
+    }
+
+    [Fact]
+    public async Task CurseForgeProxyPreservesQueryStringOnFallbackDownload()
+    {
+        var originalApiKey = Environment.GetEnvironmentVariable("CURSEFORGE_API_KEY");
+        Environment.SetEnvironmentVariable("CURSEFORGE_API_KEY", "test-api-key");
+
+        try
+        {
+            var handler = new CapturingHandler();
+            using var factory = new WebApplicationFactory<Program>()
+                .WithWebHostBuilder(builder => builder.ConfigureTestServices(services =>
+                {
+                    services.AddSingleton<IHttpClientFactory>(new CapturingHttpClientFactory(handler));
+                }));
+            using var client = factory.CreateClient();
+
+            using var response = await client.GetAsync("/v1/mods/123/files/456/download?token=abc");
+
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            Assert.NotNull(handler.Request);
+            Assert.Equal("/api/v1/mods/123/files/456/download", handler.Request.RequestUri?.AbsolutePath);
+            Assert.Equal("?token=abc", handler.Request.RequestUri?.Query);
+            Assert.Equal("www.curseforge.com", handler.Request.Headers.Host);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("CURSEFORGE_API_KEY", originalApiKey);
+        }
+    }
+
+    [Fact]
+    public async Task CurseForgeProxyPreservesQueryStringOnNonDownloadPath()
+    {
+        var originalApiKey = Environment.GetEnvironmentVariable("CURSEFORGE_API_KEY");
+        Environment.SetEnvironmentVariable("CURSEFORGE_API_KEY", "test-api-key");
+
+        try
+        {
+            var handler = new CapturingHandler();
+            using var factory = new WebApplicationFactory<Program>()
+                .WithWebHostBuilder(builder => builder.ConfigureTestServices(services =>
+                {
+                    services.AddSingleton<IHttpClientFactory>(new CapturingHttpClientFactory(handler));
+                }));
+            using var client = factory.CreateClient();
+
+            using var response = await client.GetAsync("/v1/mods/search?gameId=432&pageSize=10");
+
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            Assert.NotNull(handler.Request);
+            Assert.Equal("/v1/mods/search", handler.Request.RequestUri?.AbsolutePath);
+            Assert.Equal("?gameId=432&pageSize=10", handler.Request.RequestUri?.Query);
+            Assert.Equal("api.curseforge.com", handler.Request.Headers.Host);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("CURSEFORGE_API_KEY", originalApiKey);
+        }
+    }
+
     private sealed class CapturingHttpClientFactory(HttpMessageHandler handler) : IHttpClientFactory
     {
         public HttpClient CreateClient(string name)
