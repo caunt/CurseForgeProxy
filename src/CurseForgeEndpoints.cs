@@ -71,7 +71,7 @@ public sealed class CurseForgeEndpoints(EnvironmentConfiguration configuration, 
             {
                 return;
             }
-            catch (Exception exception) when (IsConnectionReset(exception))
+            catch (Exception exception) when (IsRetryableUpstreamFailure(exception))
             {
                 if (attempt < maxAttempts)
                     continue;
@@ -175,8 +175,13 @@ public sealed class CurseForgeEndpoints(EnvironmentConfiguration configuration, 
         return HopByHopHeaders.Contains(headerName);
     }
 
-    private static bool IsConnectionReset(Exception exception)
+    private static bool IsRetryableUpstreamFailure(Exception exception)
     {
+        if (exception is HttpRequestException httpRequestException &&
+            (httpRequestException.HttpRequestError == HttpRequestError.ConnectionError ||
+             httpRequestException.HttpRequestError == HttpRequestError.SecureConnectionError))
+            return true;
+
         var current = exception;
         while (current is not null)
         {

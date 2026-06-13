@@ -62,6 +62,33 @@ public sealed class CurseForgeProxyTests
         }
     }
 
+    [Fact]
+    public async Task CurseForgeProxyRetriesSecureConnectionErrors()
+    {
+        var originalApiKey = Environment.GetEnvironmentVariable("CURSEFORGE_API_KEY");
+        Environment.SetEnvironmentVariable("CURSEFORGE_API_KEY", "test-api-key");
+
+        try
+        {
+            var retryingHandler = new RetryingHandler();
+            using var factory = new WebApplicationFactory<Program>()
+                .WithWebHostBuilder(builder => builder.ConfigureTestServices(services =>
+                {
+                    services.AddSingleton<IHttpClientFactory>(new CapturingHttpClientFactory(retryingHandler));
+                }));
+            using var client = factory.CreateClient();
+
+            using var response = await client.GetAsync("/v1/mods/238222");
+
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            Assert.Equal(2, retryingHandler.SendAttemptCount);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("CURSEFORGE_API_KEY", originalApiKey);
+        }
+    }
+
     private sealed class CapturingHttpClientFactory(HttpMessageHandler handler) : IHttpClientFactory
     {
         public HttpClient CreateClient(string name)
@@ -79,6 +106,31 @@ public sealed class CurseForgeProxyTests
             CancellationToken cancellationToken)
         {
             Request = request;
+
+            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent("{}")
+            });
+        }
+    }
+
+    private sealed class RetryingHandler : HttpMessageHandler
+    {
+        public int SendAttemptCount { get; private set; }
+
+        protected override Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request,
+            CancellationToken cancellationToken)
+        {
+            SendAttemptCount++;
+
+            if (SendAttemptCount == 1)
+            {
+                throw new HttpRequestException(
+                    HttpRequestError.SecureConnectionError,
+                    "The SSL connection could not be established.",
+                    inner: null);
+            }
 
             return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
             {
