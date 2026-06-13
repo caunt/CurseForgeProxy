@@ -76,6 +76,12 @@ public sealed class CurseForgeEndpoints(EnvironmentConfiguration configuration, 
             {
                 return;
             }
+            catch (OperationCanceledException) when (!context.RequestAborted.IsCancellationRequested)
+            {
+                context.Response.StatusCode = StatusCodes.Status504GatewayTimeout;
+                await context.Response.WriteAsync("Upstream request timed out.", context.RequestAborted);
+                return;
+            }
             catch (Exception exception) when (IsConnectionReset(exception))
             {
                 if (attempt < maxAttempts)
