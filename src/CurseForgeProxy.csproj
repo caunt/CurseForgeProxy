@@ -8,7 +8,7 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="EgressPool.DependencyInjection" Version="26.6.13.3376" />
+    <PackageReference Include="EgressPool.DependencyInjection" Version="26.6.13.4405" />
   </ItemGroup>
 
 </Project>
