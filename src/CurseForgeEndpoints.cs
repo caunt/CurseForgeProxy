@@ -1,13 +1,18 @@
 using System.Net;
 using System.Net.Sockets;
+using System.Threading;
 using Microsoft.AspNetCore.Http.Features;
 using Microsoft.AspNetCore.Http.Extensions;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Primitives;
 using Microsoft.Net.Http.Headers;
 
 namespace CurseForgeProxy;
 
-public sealed class CurseForgeEndpoints(EnvironmentConfiguration configuration, IHttpClientFactory httpClientFactory)
+public sealed class CurseForgeEndpoints(
+    EnvironmentConfiguration configuration,
+    IHttpClientFactory httpClientFactory,
+    ILogger<CurseForgeEndpoints> logger)
 {
     public const string HttpClientName = "curseforge-egress";
 
@@ -26,6 +31,8 @@ public sealed class CurseForgeEndpoints(EnvironmentConfiguration configuration, 
         IPAddress.Parse("2600:f0f0:603::"), // AWS AMAZON, GLOBAL
         IPAddress.Parse("2600:9000:2000::") // CloudFront / AWS global edge range
     ];
+
+    private static int nextCloudFrontAddressIndex;
 
     private static readonly HashSet<string> HopByHopHeaders = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -62,10 +69,19 @@ public sealed class CurseForgeEndpoints(EnvironmentConfiguration configuration, 
 
         const int maxAttempts = 3;
         var httpClient = httpClientFactory.CreateClient(HttpClientName);
+        var cloudFrontStartIndex = GetCloudFrontStartIndex();
 
         for (var attempt = 1; attempt <= maxAttempts; attempt++)
         {
-            using var proxyRequest = CreateProxyRequest(context);
+            var cloudFrontAddress = SelectCloudFrontAddress(cloudFrontStartIndex, attempt);
+            using var proxyRequest = CreateProxyRequest(context, cloudFrontAddress);
+
+            logger.LogDebug(
+                "Sending upstream request attempt {Attempt}/{MaxAttempts} to {TargetHost} via {CloudFrontAddress}.",
+                attempt,
+                maxAttempts,
+                proxyRequest.Headers.Host,
+                cloudFrontAddress);
 
             HttpResponseMessage proxyResponse;
             try
@@ -78,21 +94,55 @@ public sealed class CurseForgeEndpoints(EnvironmentConfiguration configuration, 
             }
             catch (OperationCanceledException) when (!context.RequestAborted.IsCancellationRequested)
             {
+                logger.LogDebug(
+                    "Upstream request attempt {Attempt}/{MaxAttempts} to {TargetHost} via {CloudFrontAddress} timed out.",
+                    attempt,
+                    maxAttempts,
+                    proxyRequest.Headers.Host,
+                    cloudFrontAddress);
+
                 context.Response.StatusCode = StatusCodes.Status504GatewayTimeout;
                 await context.Response.WriteAsync("Upstream request timed out.", context.RequestAborted);
                 return;
             }
-            catch (Exception exception) when (IsConnectionReset(exception))
+            catch (Exception exception) when (IsRetryableConnectionFailure(exception))
             {
                 if (attempt < maxAttempts)
+                {
+                    logger.LogDebug(
+                        exception,
+                        "Retrying upstream request after connection failure on attempt {Attempt}/{MaxAttempts} to {TargetHost} via {CloudFrontAddress}.",
+                        attempt,
+                        maxAttempts,
+                        proxyRequest.Headers.Host,
+                        cloudFrontAddress);
                     continue;
+                }
+
+                logger.LogDebug(
+                    exception,
+                    "Upstream request failed after connection failure on attempt {Attempt}/{MaxAttempts} to {TargetHost} via {CloudFrontAddress}.",
+                    attempt,
+                    maxAttempts,
+                    proxyRequest.Headers.Host,
+                    cloudFrontAddress);
 
                 context.Response.StatusCode = StatusCodes.Status502BadGateway;
-                await context.Response.WriteAsync("Upstream connection was reset.", context.RequestAborted);
+                await context.Response.WriteAsync(
+                    IsConnectionReset(exception) ? "Upstream connection was reset." : "Upstream connection failed.",
+                    context.RequestAborted);
                 return;
             }
-            catch (HttpRequestException)
+            catch (HttpRequestException exception)
             {
+                logger.LogDebug(
+                    exception,
+                    "Upstream request failed on attempt {Attempt}/{MaxAttempts} to {TargetHost} via {CloudFrontAddress}.",
+                    attempt,
+                    maxAttempts,
+                    proxyRequest.Headers.Host,
+                    cloudFrontAddress);
+
                 context.Response.StatusCode = StatusCodes.Status502BadGateway;
                 await context.Response.WriteAsync("Upstream request failed.", context.RequestAborted);
                 return;
@@ -101,7 +151,24 @@ public sealed class CurseForgeEndpoints(EnvironmentConfiguration configuration, 
             using (proxyResponse)
             {
                 if (proxyResponse.StatusCode == HttpStatusCode.Forbidden && attempt < maxAttempts)
+                {
+                    logger.LogDebug(
+                        "Retrying upstream request after status {StatusCode} on attempt {Attempt}/{MaxAttempts} to {TargetHost} via {CloudFrontAddress}.",
+                        (int)proxyResponse.StatusCode,
+                        attempt,
+                        maxAttempts,
+                        proxyRequest.Headers.Host,
+                        cloudFrontAddress);
                     continue;
+                }
+
+                logger.LogDebug(
+                    "Upstream request completed with status {StatusCode} on attempt {Attempt}/{MaxAttempts} to {TargetHost} via {CloudFrontAddress}.",
+                    (int)proxyResponse.StatusCode,
+                    attempt,
+                    maxAttempts,
+                    proxyRequest.Headers.Host,
+                    cloudFrontAddress);
 
                 context.Response.StatusCode = (int)proxyResponse.StatusCode;
                 CopyResponseHeaders(context.Response, proxyResponse);
@@ -112,11 +179,11 @@ public sealed class CurseForgeEndpoints(EnvironmentConfiguration configuration, 
         }
     }
 
-    private HttpRequestMessage CreateProxyRequest(HttpContext context)
+    private HttpRequestMessage CreateProxyRequest(HttpContext context, IPAddress cloudFrontAddress)
     {
         var request = context.Request;
         var (targetHost, targetPath) = ResolveTarget(request);
-        var targetUri = CreateTargetUri(request, targetPath);
+        var targetUri = CreateTargetUri(request, targetPath, cloudFrontAddress);
         var proxyRequest = new HttpRequestMessage(new HttpMethod(request.Method), targetUri);
 
         if (CanHaveBody(context))
@@ -143,14 +210,32 @@ public sealed class CurseForgeEndpoints(EnvironmentConfiguration configuration, 
         return (ApiCurseForgeHost, requestPath);
     }
 
-    private static Uri CreateTargetUri(HttpRequest request, string targetPath)
+    private static Uri CreateTargetUri(HttpRequest request, string targetPath, IPAddress cloudFrontAddress)
     {
         return new Uri(UriHelper.BuildAbsolute(
             scheme: Uri.UriSchemeHttps,
-            host: new HostString(CloudFrontAddresses[0].ToString(), port: 443),
+            host: new HostString(cloudFrontAddress.ToString(), port: 443),
             pathBase: PathString.Empty,
             path: new PathString(targetPath),
             query: request.QueryString));
+    }
+
+    private static int GetCloudFrontStartIndex()
+    {
+        var index = Interlocked.Increment(ref nextCloudFrontAddressIndex) - 1;
+        return PositiveModulo(index, CloudFrontAddresses.Length);
+    }
+
+    private static IPAddress SelectCloudFrontAddress(int startIndex, int attempt)
+    {
+        var index = (startIndex + attempt - 1) % CloudFrontAddresses.Length;
+        return CloudFrontAddresses[index];
+    }
+
+    private static int PositiveModulo(int value, int divisor)
+    {
+        var result = value % divisor;
+        return result < 0 ? result + divisor : result;
     }
 
     private static bool CanHaveBody(HttpContext context)
@@ -202,14 +287,47 @@ public sealed class CurseForgeEndpoints(EnvironmentConfiguration configuration, 
 
     private static bool IsConnectionReset(Exception exception)
     {
+        return HasSocketError(exception, SocketError.ConnectionReset);
+    }
+
+    private static bool IsRetryableConnectionFailure(Exception exception)
+    {
+        var current = exception;
+        while (current is not null)
+        {
+            if (current is SocketException socketException && IsRetryableSocketError(socketException.SocketErrorCode))
+                return true;
+
+            current = current.InnerException;
+        }
+
+        return false;
+    }
+
+    private static bool HasSocketError(Exception exception, SocketError socketError)
+    {
         var current = exception;
         while (current is not null)
         {
             if (current is SocketException socketException &&
-                socketException.SocketErrorCode == SocketError.ConnectionReset)
+                socketException.SocketErrorCode == socketError)
                 return true;
             current = current.InnerException;
         }
         return false;
+    }
+
+    private static bool IsRetryableSocketError(SocketError socketError)
+    {
+        return socketError is
+            SocketError.ConnectionReset or
+            SocketError.ConnectionAborted or
+            SocketError.ConnectionRefused or
+            SocketError.TimedOut or
+            SocketError.NetworkDown or
+            SocketError.NetworkReset or
+            SocketError.NetworkUnreachable or
+            SocketError.HostDown or
+            SocketError.HostUnreachable;
     }
 }
