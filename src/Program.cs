@@ -2,6 +2,8 @@ using CurseForgeProxy;
 
 var builder = WebApplication.CreateBuilder(args);
 
+builder.Logging.SetMinimumLevel(LogLevel.Debug);
+
 builder.Services.AddSingleton<EnvironmentConfiguration>();
 builder.Services.AddSingleton<CurseForgeEndpoints>();
 
