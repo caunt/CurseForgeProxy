@@ -8,7 +8,10 @@ builder.Services.AddSingleton<EnvironmentConfiguration>();
 builder.Services.AddSingleton<CurseForgeEndpoints>();
 
 builder.Services
-    .AddEgressPool()
+    .AddEgressPool(options =>
+    {
+        options.AddressMode = Egress.EgressAddressMode.AssignOnDemand;
+    })
     .AddHttpClient(name: CurseForgeEndpoints.HttpClientName)
     .UseEgressPool();
 
