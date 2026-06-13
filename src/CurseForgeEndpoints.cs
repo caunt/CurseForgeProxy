@@ -1,4 +1,5 @@
 using System.Net;
+using System.Net.Sockets;
 using Microsoft.AspNetCore.Http.Features;
 using Microsoft.AspNetCore.Http.Extensions;
 using Microsoft.Extensions.Primitives;
@@ -54,15 +55,47 @@ public sealed class CurseForgeEndpoints(EnvironmentConfiguration configuration, 
             return;
         }
 
-        using var proxyRequest = CreateProxyRequest(context);
-        using var proxyResponse = await httpClientFactory
-            .CreateClient(HttpClientName)
-            .SendAsync(proxyRequest, HttpCompletionOption.ResponseHeadersRead, context.RequestAborted);
+        const int maxAttempts = 3;
+        var httpClient = httpClientFactory.CreateClient(HttpClientName);
 
-        context.Response.StatusCode = (int)proxyResponse.StatusCode;
-        CopyResponseHeaders(context.Response, proxyResponse);
+        for (var attempt = 1; attempt <= maxAttempts; attempt++)
+        {
+            using var proxyRequest = CreateProxyRequest(context);
 
-        await proxyResponse.Content.CopyToAsync(context.Response.Body, context.RequestAborted);
+            HttpResponseMessage proxyResponse;
+            try
+            {
+                proxyResponse = await httpClient.SendAsync(proxyRequest, HttpCompletionOption.ResponseHeadersRead, context.RequestAborted);
+            }
+            catch (OperationCanceledException) when (context.RequestAborted.IsCancellationRequested)
+            {
+                return;
+            }
+            catch (Exception exception) when (IsConnectionReset(exception))
+            {
+                if (attempt < maxAttempts)
+                    continue;
+
+                context.Response.StatusCode = StatusCodes.Status502BadGateway;
+                await context.Response.WriteAsync("Upstream connection was reset.", context.RequestAborted);
+                return;
+            }
+            catch (HttpRequestException)
+            {
+                context.Response.StatusCode = StatusCodes.Status502BadGateway;
+                await context.Response.WriteAsync("Upstream request failed.", context.RequestAborted);
+                return;
+            }
+
+            using (proxyResponse)
+            {
+                context.Response.StatusCode = (int)proxyResponse.StatusCode;
+                CopyResponseHeaders(context.Response, proxyResponse);
+
+                await proxyResponse.Content.CopyToAsync(context.Response.Body, context.RequestAborted);
+            }
+            return;
+        }
     }
 
     private HttpRequestMessage CreateProxyRequest(HttpContext context)
@@ -140,5 +173,18 @@ public sealed class CurseForgeEndpoints(EnvironmentConfiguration configuration, 
     private static bool IsHopByHopHeader(string headerName)
     {
         return HopByHopHeaders.Contains(headerName);
+    }
+
+    private static bool IsConnectionReset(Exception exception)
+    {
+        var current = exception;
+        while (current is not null)
+        {
+            if (current is SocketException socketException &&
+                socketException.SocketErrorCode == SocketError.ConnectionReset)
+                return true;
+            current = current.InnerException;
+        }
+        return false;
     }
 }
