@@ -76,7 +76,7 @@ public sealed class CurseForgeEndpoints(
             var cloudFrontAddress = SelectCloudFrontAddress(cloudFrontStartIndex, attempt);
             using var proxyRequest = CreateProxyRequest(context, cloudFrontAddress);
 
-            logger.LogDebug(
+            logger.LogTrace(
                 "Sending upstream request attempt {Attempt}/{MaxAttempts} to {TargetHost} via {CloudFrontAddress}.",
                 attempt,
                 maxAttempts,
@@ -119,7 +119,7 @@ public sealed class CurseForgeEndpoints(
                     continue;
                 }
 
-                logger.LogDebug(
+                logger.LogWarning(
                     exception,
                     "Upstream request failed after connection failure on attempt {Attempt}/{MaxAttempts} to {TargetHost} via {CloudFrontAddress}.",
                     attempt,
@@ -162,7 +162,7 @@ public sealed class CurseForgeEndpoints(
                     continue;
                 }
 
-                logger.LogDebug(
+                logger.LogTrace(
                     "Upstream request completed with status {StatusCode} on attempt {Attempt}/{MaxAttempts} to {TargetHost} via {CloudFrontAddress}.",
                     (int)proxyResponse.StatusCode,
                     attempt,
