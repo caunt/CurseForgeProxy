@@ -19,6 +19,7 @@ public sealed class CurseForgeEndpoints(
     private const string ApiCurseForgeHost = "api.curseforge.com";
     private const string WwwCurseForgeHost = "www.curseforge.com";
     private const string ApiKeyHeaderName = "x-api-key";
+    private static readonly TimeSpan UpstreamAttemptTimeout = TimeSpan.FromSeconds(5);
 
     // Matches /v1/mods/{modId}/files/{fileId}/download
     private static readonly System.Text.RegularExpressions.Regex FallbackDownloadPathPattern =
@@ -84,9 +85,12 @@ public sealed class CurseForgeEndpoints(
                 cloudFrontAddress);
 
             HttpResponseMessage proxyResponse;
+            using var attemptTimeout = CancellationTokenSource.CreateLinkedTokenSource(context.RequestAborted);
+            attemptTimeout.CancelAfter(UpstreamAttemptTimeout);
+
             try
             {
-                proxyResponse = await httpClient.SendAsync(proxyRequest, HttpCompletionOption.ResponseHeadersRead, context.RequestAborted);
+                proxyResponse = await httpClient.SendAsync(proxyRequest, HttpCompletionOption.ResponseHeadersRead, attemptTimeout.Token);
             }
             catch (OperationCanceledException) when (context.RequestAborted.IsCancellationRequested)
             {

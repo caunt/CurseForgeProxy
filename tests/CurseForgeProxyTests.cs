@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
 using Microsoft.AspNetCore.Hosting;
@@ -333,11 +334,15 @@ public sealed class CurseForgeProxyTests
                 }));
             using var client = factory.CreateClient();
 
+            var stopwatch = Stopwatch.StartNew();
             using var response = await client.GetAsync("/v1/mods/search");
+            stopwatch.Stop();
             var body = await response.Content.ReadAsStringAsync();
 
             Assert.Equal(HttpStatusCode.GatewayTimeout, response.StatusCode);
             Assert.Equal("Upstream request timed out.", body);
+            Assert.True(stopwatch.Elapsed >= TimeSpan.FromSeconds(4), $"Expected a 5-second timeout, got {stopwatch.Elapsed}.");
+            Assert.True(stopwatch.Elapsed < TimeSpan.FromSeconds(15), $"Expected a 5-second timeout, got {stopwatch.Elapsed}.");
         }
         finally
         {
@@ -599,7 +604,13 @@ public sealed class CurseForgeProxyTests
             HttpRequestMessage request,
             CancellationToken cancellationToken)
         {
-            throw new OperationCanceledException();
+            return WaitForTimeoutAsync(cancellationToken);
+        }
+
+        private static async Task<HttpResponseMessage> WaitForTimeoutAsync(CancellationToken cancellationToken)
+        {
+            await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+            throw new InvalidOperationException("Timeout handler should only complete by cancellation.");
         }
     }
 }
