@@ -1,0 +1,118 @@
+name: Publish Builds
+
+on:
+  workflow_call:
+
+jobs:
+  publish:
+    name: Publish ${{ matrix.runtimeIdentifier }}
+    runs-on: ${{ matrix.operatingSystem }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Windows
+          - { operatingSystem: windows-latest, runtimeIdentifier: win-x64 }
+          - { operatingSystem: windows-latest, runtimeIdentifier: win-arm64 }
+          - { operatingSystem: windows-latest, runtimeIdentifier: win-x86 }
+
+          # macOS
+          - { operatingSystem: macos-latest, runtimeIdentifier: osx-arm64 }
+          - { operatingSystem: macos-15-intel, runtimeIdentifier: osx-x64 }
+
+          # Ubuntu (glibc)
+          - { operatingSystem: ubuntu-latest, runtimeIdentifier: linux-x64 }
+          - { operatingSystem: ubuntu-24.04-arm, runtimeIdentifier: linux-arm64 }
+          - { operatingSystem: ubuntu-24.04-arm, runtimeIdentifier: linux-arm }
+
+          # Alpine (musl)
+          - { operatingSystem: ubuntu-latest, runtimeIdentifier: linux-musl-x64, isAlpine: true }
+          - { operatingSystem: ubuntu-24.04-arm, runtimeIdentifier: linux-musl-arm64, isAlpine: true }
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - name: Setup .NET
+        if: ${{ !matrix.isAlpine }}
+        uses: actions/setup-dotnet@9a946fdbd5fb07b82b2f5a4466058b876ab72bb2 # v5
+        with:
+          dotnet-version: latest
+
+      - name: Install Linux Prerequisites
+        if: ${{ runner.os == 'Linux' && !matrix.isAlpine }}
+        run: |
+          sudo apt-get update
+
+          if [ "${{ matrix.runtimeIdentifier }}" = "linux-arm" ]; then
+            sudo dpkg --add-architecture armhf
+            sudo apt-get update
+            sudo apt-get install -y clang zlib1g-dev libc6-dev:armhf libstdc++-13-dev:armhf gcc-arm-linux-gnueabihf
+          else
+            sudo apt-get install -y clang zlib1g-dev
+          fi
+
+      - name: Publish Application (Host)
+        if: ${{ !matrix.isAlpine }}
+        run: dotnet publish src/CurseForgeProxy.csproj -c Release -r ${{ matrix.runtimeIdentifier }} -o ./publish/${{ matrix.runtimeIdentifier }}
+
+      - name: Publish Application (Alpine Container)
+        if: ${{ matrix.isAlpine }}
+        run: |
+          docker run --rm \
+            --volume "${{ github.workspace }}:/workspace" \
+            --workdir /workspace \
+            mcr.microsoft.com/dotnet/sdk:10.0-alpine \
+            sh -c "apk add --no-cache clang build-base zlib-dev && \
+                   dotnet publish src/CurseForgeProxy.csproj \
+                   -c Release \
+                   -r ${{ matrix.runtimeIdentifier }} \
+                   -o ./publish/${{ matrix.runtimeIdentifier }}"
+
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ${{ matrix.runtimeIdentifier }}
+          path: ./publish/${{ matrix.runtimeIdentifier }}
+
+  compress_and_upload:
+    name: Compress and Upload Release Archives
+    needs: publish
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download All Artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          path: ./artifacts
+
+      - name: Compress Executables
+        shell: bash
+        run: |
+          mkdir -p ./release-archives
+          cd ./artifacts
+
+          for runtimeIdentifierDirectory in */; do
+            runtimeIdentifier=$(basename "$runtimeIdentifierDirectory")
+
+            executableFileName="CurseForgeProxy"
+            if [[ "$runtimeIdentifier" == *"win"* ]]; then
+              executableFileName="CurseForgeProxy.exe"
+            fi
+
+            architectureFilter="--x86"
+            if [[ "$runtimeIdentifier" == *"arm64"* ]]; then
+                architectureFilter="--arm64"
+            elif [[ "$runtimeIdentifier" == *"arm"* ]]; then
+                architectureFilter="--arm"
+            fi
+
+            cd "$runtimeIdentifier"
+            env XZ_OPT="$architectureFilter -9e -T0" tar -cJf "../../release-archives/${runtimeIdentifier}.tar.xz" "$executableFileName"
+            cd ..
+          done
+
+      - name: Upload Compressed Archives
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: compressed
+          path: ./release-archives/*.tar.xz
