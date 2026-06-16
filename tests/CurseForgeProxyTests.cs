@@ -12,6 +12,10 @@ namespace CurseForgeProxy.Tests;
 
 public sealed class CurseForgeProxyTests
 {
+    private const string CloudFrontTrafficLimitForbiddenBody =
+        "403 ERROR The request could not be satisfied. Request blocked. " +
+        "There might be too much traffic or a configuration error. CloudFront";
+
     [Fact]
     public async Task CurseForgeProxyWithoutAnyApiKeyReturnsBadRequest()
     {
@@ -68,7 +72,7 @@ public sealed class CurseForgeProxyTests
     }
 
     [Fact]
-    public async Task CurseForgeProxyRetriesForbiddenResponses()
+    public async Task CurseForgeProxyRetriesCloudFrontTrafficLimitForbiddenResponses()
     {
         var originalApiKey = Environment.GetEnvironmentVariable("CURSEFORGE_API_KEY");
         Environment.SetEnvironmentVariable("CURSEFORGE_API_KEY", "test-api-key");
@@ -78,7 +82,7 @@ public sealed class CurseForgeProxyTests
             var handler = new SequencedHandler(
                 new HttpResponseMessage(HttpStatusCode.Forbidden)
                 {
-                    Content = new StringContent("forbidden")
+                    Content = new StringContent(CloudFrontTrafficLimitForbiddenBody)
                 },
                 new HttpResponseMessage(HttpStatusCode.OK)
                 {
@@ -108,6 +112,46 @@ public sealed class CurseForgeProxyTests
     }
 
     [Fact]
+    public async Task CurseForgeProxyDoesNotRetryNonCloudFrontForbiddenResponses()
+    {
+        var originalApiKey = Environment.GetEnvironmentVariable("CURSEFORGE_API_KEY");
+        Environment.SetEnvironmentVariable("CURSEFORGE_API_KEY", "test-api-key");
+
+        try
+        {
+            var handler = new SequencedHandler(
+                new HttpResponseMessage(HttpStatusCode.Forbidden)
+                {
+                    Content = new StringContent("forbidden")
+                },
+                new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent("{}")
+                });
+
+            using var factory = new WebApplicationFactory<Program>()
+                .WithWebHostBuilder(builder => builder.ConfigureTestServices(services =>
+                {
+                    services.AddSingleton<IHttpClientFactory>(new CapturingHttpClientFactory(handler));
+                }));
+            using var client = factory.CreateClient();
+
+            using var response = await client.GetAsync("/v1/mods/search");
+            var body = await response.Content.ReadAsStringAsync();
+
+            Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
+            Assert.Equal("forbidden", body);
+            Assert.Equal(1, handler.RequestCount);
+            AssertDistinctCloudFrontAddresses(handler, expectedCount: 1);
+            AssertNoConnectionHeader(handler);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("CURSEFORGE_API_KEY", originalApiKey);
+        }
+    }
+
+    [Fact]
     public async Task CurseForgeProxyReturnsForbiddenAfterMaxRetries()
     {
         var originalApiKey = Environment.GetEnvironmentVariable("CURSEFORGE_API_KEY");
@@ -119,15 +163,15 @@ public sealed class CurseForgeProxyTests
             var handler = new SequencedHandler(
                 new HttpResponseMessage(HttpStatusCode.Forbidden)
                 {
-                    Content = new StringContent("forbidden-1")
+                    Content = new StringContent(CloudFrontTrafficLimitForbiddenBody + " retry-1")
                 },
                 new HttpResponseMessage(HttpStatusCode.Forbidden)
                 {
-                    Content = new StringContent("forbidden-2")
+                    Content = new StringContent(CloudFrontTrafficLimitForbiddenBody + " retry-2")
                 },
                 new HttpResponseMessage(HttpStatusCode.Forbidden)
                 {
-                    Content = new StringContent("forbidden-3")
+                    Content = new StringContent(CloudFrontTrafficLimitForbiddenBody + " retry-3")
                 });
 
             using var factory = new WebApplicationFactory<Program>()
@@ -150,7 +194,7 @@ public sealed class CurseForgeProxyTests
             var body = await response.Content.ReadAsStringAsync();
 
             Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
-            Assert.Equal("forbidden-3", body);
+            Assert.Equal(CloudFrontTrafficLimitForbiddenBody + " retry-3", body);
             Assert.Equal(3, handler.RequestCount);
             AssertDistinctCloudFrontAddresses(handler, expectedCount: 3);
             AssertNoConnectionHeader(handler);

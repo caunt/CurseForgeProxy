@@ -1,5 +1,6 @@
 using System.Net;
 using System.Net.Sockets;
+using System.Text;
 using System.Threading;
 using Microsoft.AspNetCore.Http.Features;
 using Microsoft.AspNetCore.Http.Extensions;
@@ -156,7 +157,16 @@ public sealed class CurseForgeEndpoints(
             {
                 var statusCode = (int)proxyResponse.StatusCode;
 
+                byte[]? responseBody = null;
+                var isRetryableForbiddenResponse = false;
+
                 if (proxyResponse.StatusCode == HttpStatusCode.Forbidden)
+                {
+                    responseBody = await proxyResponse.Content.ReadAsByteArrayAsync(context.RequestAborted);
+                    isRetryableForbiddenResponse = IsCloudFrontTrafficLimitForbiddenResponse(responseBody, proxyResponse);
+                }
+
+                if (isRetryableForbiddenResponse)
                 {
                     if (attempt < maxAttempts)
                     {
@@ -192,7 +202,10 @@ public sealed class CurseForgeEndpoints(
                 context.Response.StatusCode = statusCode;
                 CopyResponseHeaders(context.Response, proxyResponse);
 
-                await proxyResponse.Content.CopyToAsync(context.Response.Body, context.RequestAborted);
+                if (responseBody is not null)
+                    await context.Response.Body.WriteAsync(responseBody, context.RequestAborted);
+                else
+                    await proxyResponse.Content.CopyToAsync(context.Response.Body, context.RequestAborted);
             }
             return;
         }
@@ -301,6 +314,34 @@ public sealed class CurseForgeEndpoints(
     private static bool IsHopByHopHeader(string headerName)
     {
         return HopByHopHeaders.Contains(headerName);
+    }
+
+    private static bool IsCloudFrontTrafficLimitForbiddenResponse(byte[] responseBody, HttpResponseMessage proxyResponse)
+    {
+        var body = DecodeResponseBody(responseBody, proxyResponse);
+
+        return body.Contains("The request could not be satisfied", StringComparison.OrdinalIgnoreCase) &&
+            body.Contains("Request blocked", StringComparison.OrdinalIgnoreCase) &&
+            body.Contains("There might be too much traffic or a configuration error", StringComparison.OrdinalIgnoreCase) &&
+            body.Contains("CloudFront", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string DecodeResponseBody(byte[] responseBody, HttpResponseMessage proxyResponse)
+    {
+        var charset = proxyResponse.Content.Headers.ContentType?.CharSet;
+
+        if (!string.IsNullOrWhiteSpace(charset))
+        {
+            try
+            {
+                return Encoding.GetEncoding(charset.Trim('"')).GetString(responseBody);
+            }
+            catch (ArgumentException)
+            {
+            }
+        }
+
+        return Encoding.UTF8.GetString(responseBody);
     }
 
     private static bool IsConnectionReset(Exception exception)
