@@ -2,165 +2,351 @@ using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
-using Microsoft.AspNetCore.Hosting;
+
 using Microsoft.AspNetCore.Mvc.Testing;
-using Microsoft.AspNetCore.TestHost;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 
 namespace CurseForgeProxy.Tests;
 
+/// <summary>
+/// Exercises the proxy end to end through an in-memory test server, with fake message handlers standing in for CurseForge.
+/// </summary>
 public sealed class CurseForgeProxyTests
 {
     private const string CloudFrontTrafficLimitForbiddenBody =
         "403 ERROR The request could not be satisfied. Request blocked. " +
         "There might be too much traffic or a configuration error. CloudFront";
 
+    /// <summary>
+    /// A plain 403 without CloudFront's traffic-limit page goes straight back to the caller after a single upstream attempt.
+    /// </summary>
     [Fact]
-    public async Task CurseForgeProxyWithoutAnyApiKeyReturnsBadRequest()
+    public async Task CurseForgeProxyDoesNotRetryNonCloudFrontForbiddenResponses()
     {
-        var originalApiKey = Environment.GetEnvironmentVariable("CURSEFORGE_API_KEY");
-        Environment.SetEnvironmentVariable("CURSEFORGE_API_KEY", null);
+        string? originalApiKey = Environment.GetEnvironmentVariable(variable: "CURSEFORGE_API_KEY");
+        Environment.SetEnvironmentVariable(variable: "CURSEFORGE_API_KEY", value: "test-api-key");
 
         try
         {
-            using var factory = new WebApplicationFactory<Program>();
-            using var client = factory.CreateClient();
-
-            using var response = await client.GetAsync("/");
-            var body = await response.Content.ReadAsStringAsync();
-
-            Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
-            Assert.Contains("Missing x-api-key header", body);
-        }
-        finally
-        {
-            Environment.SetEnvironmentVariable("CURSEFORGE_API_KEY", originalApiKey);
-        }
-    }
-
-    [Fact]
-    public async Task CurseForgeProxyForwardsRequestPathWithoutPrefix()
-    {
-        var originalApiKey = Environment.GetEnvironmentVariable("CURSEFORGE_API_KEY");
-        Environment.SetEnvironmentVariable("CURSEFORGE_API_KEY", "test-api-key");
-
-        try
-        {
-            var handler = new CapturingHandler();
-            using var factory = new WebApplicationFactory<Program>()
-                .WithWebHostBuilder(builder => builder.ConfigureTestServices(services =>
+            using SequencedHandler handler = new(
+                new HttpResponseMessage(HttpStatusCode.Forbidden)
                 {
-                    services.AddSingleton<IHttpClientFactory>(new CapturingHttpClientFactory(handler));
-                }));
-            using var client = factory.CreateClient();
+                    Content = new StringContent(content: "forbidden")
+                },
+                new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent(content: "{}")
+                }
+            );
 
-            using var response = await client.GetAsync("/v1/mods/search?gameId=432");
+            using ProxyApplicationFactory factory = new(handler);
 
-            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-            Assert.NotNull(handler.Request);
-            Assert.Equal("/v1/mods/search", handler.Request.RequestUri?.AbsolutePath);
-            Assert.Equal("?gameId=432", handler.Request.RequestUri?.Query);
-            Assert.Equal("api.curseforge.com", handler.Request.Headers.Host);
-            Assert.True(handler.Request.Headers.Contains("x-api-key"));
+            using HttpClient client = factory.CreateClient();
+
+            using HttpResponseMessage response = await client.GetAsync(new Uri(uriString: "/v1/mods/search", UriKind.Relative));
+
+            string body = await response.Content.ReadAsStringAsync();
+
+            Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
+            Assert.Equal(expected: "forbidden", body);
+            Assert.Equal(expected: 1, handler.RequestCount);
+            AssertDistinctCloudFrontAddresses(handler, expectedCount: 1);
             AssertNoConnectionHeader(handler);
         }
         finally
         {
-            Environment.SetEnvironmentVariable("CURSEFORGE_API_KEY", originalApiKey);
+            Environment.SetEnvironmentVariable(variable: "CURSEFORGE_API_KEY", originalApiKey);
         }
     }
 
+    /// <summary>
+    /// A mod file download URL is sent to www.curseforge.com under the /api prefix instead of the API host.
+    /// </summary>
     [Fact]
-    public async Task CurseForgeProxyRetriesCloudFrontTrafficLimitForbiddenResponses()
+    public async Task CurseForgeProxyForwardsFallbackDownloadToWwwCurseForge()
     {
-        var originalApiKey = Environment.GetEnvironmentVariable("CURSEFORGE_API_KEY");
-        Environment.SetEnvironmentVariable("CURSEFORGE_API_KEY", "test-api-key");
+        string? originalApiKey = Environment.GetEnvironmentVariable(variable: "CURSEFORGE_API_KEY");
+        Environment.SetEnvironmentVariable(variable: "CURSEFORGE_API_KEY", value: "test-api-key");
 
         try
         {
-            var handler = new SequencedHandler(
+            using CapturingHandler handler = new();
+
+            using ProxyApplicationFactory factory = new(handler);
+
+            using HttpClient client = factory.CreateClient();
+
+            using HttpResponseMessage response = await client.GetAsync(new Uri(uriString: "/v1/mods/783522/files/7842394/download", UriKind.Relative));
+
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            Assert.NotNull(handler.Request);
+            Assert.Equal(expected: "/api/v1/mods/783522/files/7842394/download", handler.Request.RequestUri?.AbsolutePath);
+            Assert.Equal(expected: "www.curseforge.com", handler.Request.Headers.Host);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(variable: "CURSEFORGE_API_KEY", originalApiKey);
+        }
+    }
+
+    /// <summary>
+    /// A file metadata path without the trailing /download segment keeps its path and goes to api.curseforge.com.
+    /// </summary>
+    [Fact]
+    public async Task CurseForgeProxyForwardsNonDownloadFilePathToApiCurseForge()
+    {
+        string? originalApiKey = Environment.GetEnvironmentVariable(variable: "CURSEFORGE_API_KEY");
+        Environment.SetEnvironmentVariable(variable: "CURSEFORGE_API_KEY", value: "test-api-key");
+
+        try
+        {
+            using CapturingHandler handler = new();
+
+            using ProxyApplicationFactory factory = new(handler);
+
+            using HttpClient client = factory.CreateClient();
+
+            using HttpResponseMessage response = await client.GetAsync(new Uri(uriString: "/v1/mods/123/files/456", UriKind.Relative));
+
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            Assert.NotNull(handler.Request);
+            Assert.Equal(expected: "/v1/mods/123/files/456", handler.Request.RequestUri?.AbsolutePath);
+            Assert.Equal(expected: "api.curseforge.com", handler.Request.Headers.Host);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(variable: "CURSEFORGE_API_KEY", originalApiKey);
+        }
+    }
+
+    /// <summary>
+    /// An ordinary API request keeps its path and query, gains the configured x-api-key, and carries no Connection header upstream.
+    /// </summary>
+    [Fact]
+    public async Task CurseForgeProxyForwardsRequestPathWithoutPrefix()
+    {
+        string? originalApiKey = Environment.GetEnvironmentVariable(variable: "CURSEFORGE_API_KEY");
+        Environment.SetEnvironmentVariable(variable: "CURSEFORGE_API_KEY", value: "test-api-key");
+
+        try
+        {
+            using CapturingHandler handler = new();
+
+            using ProxyApplicationFactory factory = new(handler);
+
+            using HttpClient client = factory.CreateClient();
+
+            using HttpResponseMessage response = await client.GetAsync(new Uri(uriString: "/v1/mods/search?gameId=432", UriKind.Relative));
+
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            Assert.NotNull(handler.Request);
+            Assert.Equal(expected: "/v1/mods/search", handler.Request.RequestUri?.AbsolutePath);
+            Assert.Equal(expected: "?gameId=432", handler.Request.RequestUri?.Query);
+            Assert.Equal(expected: "api.curseforge.com", handler.Request.Headers.Host);
+            Assert.True(handler.Request.Headers.Contains(name: "x-api-key"));
+            AssertNoConnectionHeader(handler);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(variable: "CURSEFORGE_API_KEY", originalApiKey);
+        }
+    }
+
+    /// <summary>
+    /// An upstream 302 reaches the caller untouched, Location header included, instead of being followed by the proxy.
+    /// </summary>
+    [Fact]
+    public async Task CurseForgeProxyPassesThroughRedirectResponses()
+    {
+        string? originalApiKey = Environment.GetEnvironmentVariable(variable: "CURSEFORGE_API_KEY");
+        Environment.SetEnvironmentVariable(variable: "CURSEFORGE_API_KEY", value: "test-api-key");
+
+        try
+        {
+            using SequencedHandler handler = new(
+                new HttpResponseMessage(HttpStatusCode.Found)
+                {
+                    Headers = { Location = new Uri(uriString: "https://edge.forgecdn.net/files/mod.jar") },
+                    Content = new StringContent(string.Empty)
+                }
+            );
+
+            using ProxyApplicationFactory factory = new(handler);
+
+            using HttpClient client = factory.CreateClient(new WebApplicationFactoryClientOptions { AllowAutoRedirect = false });
+
+            using HttpResponseMessage response = await client.GetAsync(new Uri(uriString: "/v1/mods/783522/files/7842394/download", UriKind.Relative));
+
+            Assert.Equal(HttpStatusCode.Found, response.StatusCode);
+            Assert.Equal(expected: "https://edge.forgecdn.net/files/mod.jar", response.Headers.Location?.ToString());
+            Assert.Equal(expected: 1, handler.RequestCount);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(variable: "CURSEFORGE_API_KEY", originalApiKey);
+        }
+    }
+
+    /// <summary>
+    /// Query parameters survive the rewrite of a download URL to the website's /api route.
+    /// </summary>
+    [Fact]
+    public async Task CurseForgeProxyPreservesQueryStringOnFallbackDownload()
+    {
+        string? originalApiKey = Environment.GetEnvironmentVariable(variable: "CURSEFORGE_API_KEY");
+        Environment.SetEnvironmentVariable(variable: "CURSEFORGE_API_KEY", value: "test-api-key");
+
+        try
+        {
+            using CapturingHandler handler = new();
+
+            using ProxyApplicationFactory factory = new(handler);
+
+            using HttpClient client = factory.CreateClient();
+
+            using HttpResponseMessage response = await client.GetAsync(new Uri(uriString: "/v1/mods/123/files/456/download?token=abc", UriKind.Relative));
+
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            Assert.NotNull(handler.Request);
+            Assert.Equal(expected: "/api/v1/mods/123/files/456/download", handler.Request.RequestUri?.AbsolutePath);
+            Assert.Equal(expected: "?token=abc", handler.Request.RequestUri?.Query);
+            Assert.Equal(expected: "www.curseforge.com", handler.Request.Headers.Host);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(variable: "CURSEFORGE_API_KEY", originalApiKey);
+        }
+    }
+
+    /// <summary>
+    /// Several query parameters reach api.curseforge.com exactly as the caller sent them, order included.
+    /// </summary>
+    [Fact]
+    public async Task CurseForgeProxyPreservesQueryStringOnNonDownloadPath()
+    {
+        string? originalApiKey = Environment.GetEnvironmentVariable(variable: "CURSEFORGE_API_KEY");
+        Environment.SetEnvironmentVariable(variable: "CURSEFORGE_API_KEY", value: "test-api-key");
+
+        try
+        {
+            using CapturingHandler handler = new();
+
+            using ProxyApplicationFactory factory = new(handler);
+
+            using HttpClient client = factory.CreateClient();
+
+            using HttpResponseMessage response = await client.GetAsync(new Uri(uriString: "/v1/mods/search?gameId=432&pageSize=10", UriKind.Relative));
+
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            Assert.NotNull(handler.Request);
+            Assert.Equal(expected: "/v1/mods/search", handler.Request.RequestUri?.AbsolutePath);
+            Assert.Equal(expected: "?gameId=432&pageSize=10", handler.Request.RequestUri?.Query);
+            Assert.Equal(expected: "api.curseforge.com", handler.Request.Headers.Host);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(variable: "CURSEFORGE_API_KEY", originalApiKey);
+        }
+    }
+
+    /// <summary>
+    /// CloudFront's traffic-limit 403 page triggers a retry through another edge address, and the caller gets the successful second response.
+    /// </summary>
+    [Fact]
+    public async Task CurseForgeProxyRetriesCloudFrontTrafficLimitForbiddenResponses()
+    {
+        string? originalApiKey = Environment.GetEnvironmentVariable(variable: "CURSEFORGE_API_KEY");
+        Environment.SetEnvironmentVariable(variable: "CURSEFORGE_API_KEY", value: "test-api-key");
+
+        try
+        {
+            using SequencedHandler handler = new(
                 new HttpResponseMessage(HttpStatusCode.Forbidden)
                 {
                     Content = new StringContent(CloudFrontTrafficLimitForbiddenBody)
                 },
                 new HttpResponseMessage(HttpStatusCode.OK)
                 {
-                    Content = new StringContent("{}")
-                });
+                    Content = new StringContent(content: "{}")
+                }
+            );
 
-            using var factory = new WebApplicationFactory<Program>()
-                .WithWebHostBuilder(builder => builder.ConfigureTestServices(services =>
-                {
-                    services.AddSingleton<IHttpClientFactory>(new CapturingHttpClientFactory(handler));
-                }));
-            using var client = factory.CreateClient();
+            using ProxyApplicationFactory factory = new(handler);
 
-            using var response = await client.GetAsync("/v1/mods/search");
-            var body = await response.Content.ReadAsStringAsync();
+            using HttpClient client = factory.CreateClient();
+
+            using HttpResponseMessage response = await client.GetAsync(new Uri(uriString: "/v1/mods/search", UriKind.Relative));
+
+            string body = await response.Content.ReadAsStringAsync();
 
             Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-            Assert.Equal("{}", body);
-            Assert.Equal(2, handler.RequestCount);
+            Assert.Equal(expected: "{}", body);
+            Assert.Equal(expected: 2, handler.RequestCount);
             AssertDistinctCloudFrontAddresses(handler, expectedCount: 2);
             AssertNoConnectionHeader(handler);
         }
         finally
         {
-            Environment.SetEnvironmentVariable("CURSEFORGE_API_KEY", originalApiKey);
+            Environment.SetEnvironmentVariable(variable: "CURSEFORGE_API_KEY", originalApiKey);
         }
     }
 
+    /// <summary>
+    /// A connection reset on the first edge address is retried once on another address before the response is returned.
+    /// </summary>
     [Fact]
-    public async Task CurseForgeProxyDoesNotRetryNonCloudFrontForbiddenResponses()
+    public async Task CurseForgeProxyRetriesConnectionFailuresOnDifferentCloudFrontAddresses()
     {
-        var originalApiKey = Environment.GetEnvironmentVariable("CURSEFORGE_API_KEY");
-        Environment.SetEnvironmentVariable("CURSEFORGE_API_KEY", "test-api-key");
+        string? originalApiKey = Environment.GetEnvironmentVariable(variable: "CURSEFORGE_API_KEY");
+        Environment.SetEnvironmentVariable(variable: "CURSEFORGE_API_KEY", value: "test-api-key");
 
         try
         {
-            var handler = new SequencedHandler(
-                new HttpResponseMessage(HttpStatusCode.Forbidden)
+            using SequencedHandler handler = new(
+                static () => throw new SocketException((int)SocketError.ConnectionReset),
+                static () => new HttpResponseMessage(HttpStatusCode.OK)
                 {
-                    Content = new StringContent("forbidden")
-                },
-                new HttpResponseMessage(HttpStatusCode.OK)
-                {
-                    Content = new StringContent("{}")
-                });
+                    Content = new StringContent(content: "{}")
+                }
+            );
 
-            using var factory = new WebApplicationFactory<Program>()
-                .WithWebHostBuilder(builder => builder.ConfigureTestServices(services =>
-                {
-                    services.AddSingleton<IHttpClientFactory>(new CapturingHttpClientFactory(handler));
-                }));
-            using var client = factory.CreateClient();
+            using ProxyApplicationFactory factory = new(handler);
 
-            using var response = await client.GetAsync("/v1/mods/search");
-            var body = await response.Content.ReadAsStringAsync();
+            using HttpClient client = factory.CreateClient();
 
-            Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
-            Assert.Equal("forbidden", body);
-            Assert.Equal(1, handler.RequestCount);
-            AssertDistinctCloudFrontAddresses(handler, expectedCount: 1);
+            using HttpResponseMessage response = await client.GetAsync(new Uri(uriString: "/v1/mods/search", UriKind.Relative));
+
+            string body = await response.Content.ReadAsStringAsync();
+
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            Assert.Equal(expected: "{}", body);
+            Assert.Equal(expected: 2, handler.RequestCount);
+            AssertDistinctCloudFrontAddresses(handler, expectedCount: 2);
             AssertNoConnectionHeader(handler);
         }
         finally
         {
-            Environment.SetEnvironmentVariable("CURSEFORGE_API_KEY", originalApiKey);
+            Environment.SetEnvironmentVariable(variable: "CURSEFORGE_API_KEY", originalApiKey);
         }
     }
 
+    /// <summary>
+    /// When all three attempts hit CloudFront's traffic-limit page, the last 403 body is returned and a warning names the final attempt.
+    /// </summary>
     [Fact]
-    public async Task CurseForgeProxyReturnsForbiddenAfterMaxRetries()
+    public async Task CurseForgeProxyReturnsForbiddenAfterMaximumRetries()
     {
-        var originalApiKey = Environment.GetEnvironmentVariable("CURSEFORGE_API_KEY");
-        Environment.SetEnvironmentVariable("CURSEFORGE_API_KEY", "test-api-key");
+        string? originalApiKey = Environment.GetEnvironmentVariable(variable: "CURSEFORGE_API_KEY");
+        Environment.SetEnvironmentVariable(variable: "CURSEFORGE_API_KEY", value: "test-api-key");
 
         try
         {
-            using var loggerProvider = new CapturingLoggerProvider();
-            var handler = new SequencedHandler(
+            using CapturingLoggerProvider loggerProvider = new();
+
+            using SequencedHandler handler = new(
                 new HttpResponseMessage(HttpStatusCode.Forbidden)
                 {
                     Content = new StringContent(CloudFrontTrafficLimitForbiddenBody + " retry-1")
@@ -172,314 +358,186 @@ public sealed class CurseForgeProxyTests
                 new HttpResponseMessage(HttpStatusCode.Forbidden)
                 {
                     Content = new StringContent(CloudFrontTrafficLimitForbiddenBody + " retry-3")
-                });
+                }
+            );
 
-            using var factory = new WebApplicationFactory<Program>()
-                .WithWebHostBuilder(builder =>
-                {
-                    builder.ConfigureLogging(logging =>
-                    {
-                        logging.ClearProviders();
-                        logging.AddProvider(loggerProvider);
-                    });
+            using ProxyApplicationFactory factory = new(handler, loggerProvider);
 
-                    builder.ConfigureTestServices(services =>
-                    {
-                        services.AddSingleton<IHttpClientFactory>(new CapturingHttpClientFactory(handler));
-                    });
-                });
-            using var client = factory.CreateClient();
+            using HttpClient client = factory.CreateClient();
 
-            using var response = await client.GetAsync("/v1/mods/search");
-            var body = await response.Content.ReadAsStringAsync();
+            using HttpResponseMessage response = await client.GetAsync(new Uri(uriString: "/v1/mods/search", UriKind.Relative));
+
+            string body = await response.Content.ReadAsStringAsync();
 
             Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
             Assert.Equal(CloudFrontTrafficLimitForbiddenBody + " retry-3", body);
-            Assert.Equal(3, handler.RequestCount);
+            Assert.Equal(expected: 3, handler.RequestCount);
             AssertDistinctCloudFrontAddresses(handler, expectedCount: 3);
             AssertNoConnectionHeader(handler);
-            Assert.Contains(loggerProvider.Entries, entry =>
-                entry.CategoryName == typeof(CurseForgeEndpoints).FullName &&
-                entry.LogLevel == LogLevel.Warning &&
-                entry.Message.Contains("Upstream request failed after status 403 on attempt 3/3", StringComparison.Ordinal));
+            Assert.Contains(
+                loggerProvider.Entries,
+                static entry => entry.CategoryName == typeof(CurseForgeEndpoints).FullName
+                    && entry.LogLevel == LogLevel.Warning
+                    && entry.Message.Contains(value: "Upstream request failed after status 403 on attempt 3/3", StringComparison.Ordinal)
+            );
         }
         finally
         {
-            Environment.SetEnvironmentVariable("CURSEFORGE_API_KEY", originalApiKey);
+            Environment.SetEnvironmentVariable(variable: "CURSEFORGE_API_KEY", originalApiKey);
         }
     }
 
+    /// <summary>
+    /// Three consecutive connection resets end in 502 Bad Gateway, with a warning that carries the socket exception.
+    /// </summary>
     [Fact]
-    public async Task CurseForgeProxyRetriesConnectionFailuresOnDifferentCloudFrontAddresses()
+    public async Task CurseForgeProxyReturnsGatewayForConnectionFailureAfterMaximumRetries()
     {
-        var originalApiKey = Environment.GetEnvironmentVariable("CURSEFORGE_API_KEY");
-        Environment.SetEnvironmentVariable("CURSEFORGE_API_KEY", "test-api-key");
+        string? originalApiKey = Environment.GetEnvironmentVariable(variable: "CURSEFORGE_API_KEY");
+        Environment.SetEnvironmentVariable(variable: "CURSEFORGE_API_KEY", value: "test-api-key");
 
         try
         {
-            var handler = new SequencedHandler(
-                () => throw new SocketException((int)SocketError.ConnectionReset),
-                () => new HttpResponseMessage(HttpStatusCode.OK)
-                {
-                    Content = new StringContent("{}")
-                });
+            using CapturingLoggerProvider loggerProvider = new();
 
-            using var factory = new WebApplicationFactory<Program>()
-                .WithWebHostBuilder(builder => builder.ConfigureTestServices(services =>
-                {
-                    services.AddSingleton<IHttpClientFactory>(new CapturingHttpClientFactory(handler));
-                }));
-            using var client = factory.CreateClient();
+            using SequencedHandler handler = new(
+                static () => throw new SocketException((int)SocketError.ConnectionReset),
+                static () => throw new SocketException((int)SocketError.ConnectionReset),
+                static () => throw new SocketException((int)SocketError.ConnectionReset)
+            );
 
-            using var response = await client.GetAsync("/v1/mods/search");
-            var body = await response.Content.ReadAsStringAsync();
+            using ProxyApplicationFactory factory = new(handler, loggerProvider);
 
-            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-            Assert.Equal("{}", body);
-            Assert.Equal(2, handler.RequestCount);
-            AssertDistinctCloudFrontAddresses(handler, expectedCount: 2);
-            AssertNoConnectionHeader(handler);
-        }
-        finally
-        {
-            Environment.SetEnvironmentVariable("CURSEFORGE_API_KEY", originalApiKey);
-        }
-    }
+            using HttpClient client = factory.CreateClient();
 
-    [Fact]
-    public async Task CurseForgeProxyReturnsGatewayForConnectionFailureAfterMaxRetries()
-    {
-        var originalApiKey = Environment.GetEnvironmentVariable("CURSEFORGE_API_KEY");
-        Environment.SetEnvironmentVariable("CURSEFORGE_API_KEY", "test-api-key");
+            using HttpResponseMessage response = await client.GetAsync(new Uri(uriString: "/v1/mods/search", UriKind.Relative));
 
-        try
-        {
-            using var loggerProvider = new CapturingLoggerProvider();
-            var handler = new SequencedHandler(
-                () => throw new SocketException((int)SocketError.ConnectionReset),
-                () => throw new SocketException((int)SocketError.ConnectionReset),
-                () => throw new SocketException((int)SocketError.ConnectionReset));
-
-            using var factory = new WebApplicationFactory<Program>()
-                .WithWebHostBuilder(builder =>
-                {
-                    builder.ConfigureLogging(logging =>
-                    {
-                        logging.ClearProviders();
-                        logging.AddProvider(loggerProvider);
-                    });
-
-                    builder.ConfigureTestServices(services =>
-                    {
-                        services.AddSingleton<IHttpClientFactory>(new CapturingHttpClientFactory(handler));
-                    });
-                });
-            using var client = factory.CreateClient();
-
-            using var response = await client.GetAsync("/v1/mods/search");
-            var body = await response.Content.ReadAsStringAsync();
+            string body = await response.Content.ReadAsStringAsync();
 
             Assert.Equal(HttpStatusCode.BadGateway, response.StatusCode);
-            Assert.Equal("Upstream connection was reset.", body);
-            Assert.Equal(3, handler.RequestCount);
+            Assert.Equal(expected: "Upstream connection was reset.", body);
+            Assert.Equal(expected: 3, handler.RequestCount);
             AssertDistinctCloudFrontAddresses(handler, expectedCount: 3);
             AssertNoConnectionHeader(handler);
-            Assert.Contains(loggerProvider.Entries, entry =>
-                entry.CategoryName == typeof(CurseForgeEndpoints).FullName &&
-                entry.LogLevel == LogLevel.Warning &&
-                entry.Exception is SocketException &&
-                entry.Message.Contains("Upstream request failed after connection failure on attempt 3/3", StringComparison.Ordinal));
+            Assert.Contains(
+                loggerProvider.Entries,
+                static entry => entry.CategoryName == typeof(CurseForgeEndpoints).FullName
+                    && entry.LogLevel == LogLevel.Warning
+                    && entry.Exception is SocketException
+                    && entry.Message.Contains(value: "Upstream request failed after connection failure on attempt 3/3", StringComparison.Ordinal)
+            );
         }
         finally
         {
-            Environment.SetEnvironmentVariable("CURSEFORGE_API_KEY", originalApiKey);
+            Environment.SetEnvironmentVariable(variable: "CURSEFORGE_API_KEY", originalApiKey);
         }
     }
 
-    [Fact]
-    public async Task CurseForgeProxyForwardsFallbackDownloadToWwwCurseForge()
-    {
-        var originalApiKey = Environment.GetEnvironmentVariable("CURSEFORGE_API_KEY");
-        Environment.SetEnvironmentVariable("CURSEFORGE_API_KEY", "test-api-key");
-
-        try
-        {
-            var handler = new CapturingHandler();
-            using var factory = new WebApplicationFactory<Program>()
-                .WithWebHostBuilder(builder => builder.ConfigureTestServices(services =>
-                {
-                    services.AddSingleton<IHttpClientFactory>(new CapturingHttpClientFactory(handler));
-                }));
-            using var client = factory.CreateClient();
-
-            using var response = await client.GetAsync("/v1/mods/783522/files/7842394/download");
-
-            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-            Assert.NotNull(handler.Request);
-            Assert.Equal("/api/v1/mods/783522/files/7842394/download", handler.Request.RequestUri?.AbsolutePath);
-            Assert.Equal("www.curseforge.com", handler.Request.Headers.Host);
-        }
-        finally
-        {
-            Environment.SetEnvironmentVariable("CURSEFORGE_API_KEY", originalApiKey);
-        }
-    }
-
-    [Fact]
-    public async Task CurseForgeProxyPassesThroughRedirectResponses()
-    {
-        var originalApiKey = Environment.GetEnvironmentVariable("CURSEFORGE_API_KEY");
-        Environment.SetEnvironmentVariable("CURSEFORGE_API_KEY", "test-api-key");
-
-        try
-        {
-            var handler = new SequencedHandler(
-                new HttpResponseMessage(HttpStatusCode.Found)
-                {
-                    Headers = { Location = new Uri("https://edge.forgecdn.net/files/mod.jar") },
-                    Content = new StringContent(string.Empty)
-                });
-
-            using var factory = new WebApplicationFactory<Program>()
-                .WithWebHostBuilder(builder => builder.ConfigureTestServices(services =>
-                {
-                    services.AddSingleton<IHttpClientFactory>(new CapturingHttpClientFactory(handler));
-                }));
-            using var client = factory.CreateClient(new WebApplicationFactoryClientOptions
-            {
-                AllowAutoRedirect = false
-            });
-
-            using var response = await client.GetAsync("/v1/mods/783522/files/7842394/download");
-
-            Assert.Equal(HttpStatusCode.Found, response.StatusCode);
-            Assert.Equal("https://edge.forgecdn.net/files/mod.jar", response.Headers.Location?.ToString());
-            Assert.Equal(1, handler.RequestCount);
-        }
-        finally
-        {
-            Environment.SetEnvironmentVariable("CURSEFORGE_API_KEY", originalApiKey);
-        }
-    }
-
+    /// <summary>
+    /// An upstream that never answers is abandoned after the five-second attempt timeout with 504 Gateway Timeout.
+    /// </summary>
     [Fact]
     public async Task CurseForgeProxyReturnsGatewayTimeoutForUpstreamTimeout()
     {
-        var originalApiKey = Environment.GetEnvironmentVariable("CURSEFORGE_API_KEY");
-        Environment.SetEnvironmentVariable("CURSEFORGE_API_KEY", "test-api-key");
+        string? originalApiKey = Environment.GetEnvironmentVariable(variable: "CURSEFORGE_API_KEY");
+        Environment.SetEnvironmentVariable(variable: "CURSEFORGE_API_KEY", value: "test-api-key");
 
         try
         {
-            var handler = new TimeoutHandler();
-            using var factory = new WebApplicationFactory<Program>()
-                .WithWebHostBuilder(builder => builder.ConfigureTestServices(services =>
-                {
-                    services.AddSingleton<IHttpClientFactory>(new CapturingHttpClientFactory(handler));
-                }));
-            using var client = factory.CreateClient();
+            using TimeoutHandler handler = new();
 
-            var stopwatch = Stopwatch.StartNew();
-            using var response = await client.GetAsync("/v1/mods/search");
+            using ProxyApplicationFactory factory = new(handler);
+
+            using HttpClient client = factory.CreateClient();
+
+            Stopwatch stopwatch = Stopwatch.StartNew();
+
+            using HttpResponseMessage response = await client.GetAsync(new Uri(uriString: "/v1/mods/search", UriKind.Relative));
+
             stopwatch.Stop();
-            var body = await response.Content.ReadAsStringAsync();
+            string body = await response.Content.ReadAsStringAsync();
 
             Assert.Equal(HttpStatusCode.GatewayTimeout, response.StatusCode);
-            Assert.Equal("Upstream request timed out.", body);
-            Assert.True(stopwatch.Elapsed >= TimeSpan.FromSeconds(4), $"Expected a 5-second timeout, got {stopwatch.Elapsed}.");
-            Assert.True(stopwatch.Elapsed < TimeSpan.FromSeconds(15), $"Expected a 5-second timeout, got {stopwatch.Elapsed}.");
+            Assert.Equal(expected: "Upstream request timed out.", body);
+            Assert.True(stopwatch.Elapsed >= TimeSpan.FromSeconds(seconds: 4), $"Expected a 5-second timeout, got {stopwatch.Elapsed}.");
+            Assert.True(stopwatch.Elapsed < TimeSpan.FromSeconds(seconds: 15), $"Expected a 5-second timeout, got {stopwatch.Elapsed}.");
         }
         finally
         {
-            Environment.SetEnvironmentVariable("CURSEFORGE_API_KEY", originalApiKey);
+            Environment.SetEnvironmentVariable(variable: "CURSEFORGE_API_KEY", originalApiKey);
         }
     }
 
+    /// <summary>
+    /// With neither a caller x-api-key header nor CURSEFORGE_API_KEY, the proxy answers 400 without contacting upstream.
+    /// </summary>
     [Fact]
-    public async Task CurseForgeProxyForwardsNonDownloadFilePathToApiCurseForge()
+    public async Task CurseForgeProxyWithoutAnyApiKeyReturnsBadRequest()
     {
-        var originalApiKey = Environment.GetEnvironmentVariable("CURSEFORGE_API_KEY");
-        Environment.SetEnvironmentVariable("CURSEFORGE_API_KEY", "test-api-key");
+        string? originalApiKey = Environment.GetEnvironmentVariable(variable: "CURSEFORGE_API_KEY");
+        Environment.SetEnvironmentVariable(variable: "CURSEFORGE_API_KEY", value: null);
 
         try
         {
-            var handler = new CapturingHandler();
-            using var factory = new WebApplicationFactory<Program>()
-                .WithWebHostBuilder(builder => builder.ConfigureTestServices(services =>
-                {
-                    services.AddSingleton<IHttpClientFactory>(new CapturingHttpClientFactory(handler));
-                }));
-            using var client = factory.CreateClient();
+            using WebApplicationFactory<Program> factory = new();
 
-            using var response = await client.GetAsync("/v1/mods/123/files/456");
+            using HttpClient client = factory.CreateClient();
 
-            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-            Assert.NotNull(handler.Request);
-            Assert.Equal("/v1/mods/123/files/456", handler.Request.RequestUri?.AbsolutePath);
-            Assert.Equal("api.curseforge.com", handler.Request.Headers.Host);
+            using HttpResponseMessage response = await client.GetAsync(new Uri(uriString: "/", UriKind.Relative));
+
+            string body = await response.Content.ReadAsStringAsync();
+
+            Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+            Assert.Contains(expectedSubstring: "Missing x-api-key header", body, StringComparison.Ordinal);
         }
         finally
         {
-            Environment.SetEnvironmentVariable("CURSEFORGE_API_KEY", originalApiKey);
+            Environment.SetEnvironmentVariable(variable: "CURSEFORGE_API_KEY", originalApiKey);
         }
     }
 
-    [Fact]
-    public async Task CurseForgeProxyPreservesQueryStringOnFallbackDownload()
+    private static void AssertDistinctCloudFrontAddresses(SequencedHandler handler, int expectedCount)
     {
-        var originalApiKey = Environment.GetEnvironmentVariable("CURSEFORGE_API_KEY");
-        Environment.SetEnvironmentVariable("CURSEFORGE_API_KEY", "test-api-key");
-
-        try
-        {
-            var handler = new CapturingHandler();
-            using var factory = new WebApplicationFactory<Program>()
-                .WithWebHostBuilder(builder => builder.ConfigureTestServices(services =>
-                {
-                    services.AddSingleton<IHttpClientFactory>(new CapturingHttpClientFactory(handler));
-                }));
-            using var client = factory.CreateClient();
-
-            using var response = await client.GetAsync("/v1/mods/123/files/456/download?token=abc");
-
-            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-            Assert.NotNull(handler.Request);
-            Assert.Equal("/api/v1/mods/123/files/456/download", handler.Request.RequestUri?.AbsolutePath);
-            Assert.Equal("?token=abc", handler.Request.RequestUri?.Query);
-            Assert.Equal("www.curseforge.com", handler.Request.Headers.Host);
-        }
-        finally
-        {
-            Environment.SetEnvironmentVariable("CURSEFORGE_API_KEY", originalApiKey);
-        }
+        Assert.Equal(expectedCount, handler.RequestUris.Count);
+        Assert.Equal(expectedCount, handler.RequestUris.Select(static uri => uri.Host).Distinct(StringComparer.OrdinalIgnoreCase).Count());
     }
 
-    [Fact]
-    public async Task CurseForgeProxyPreservesQueryStringOnNonDownloadPath()
+    private static void AssertNoConnectionHeader(CapturingHandler handler)
     {
-        var originalApiKey = Environment.GetEnvironmentVariable("CURSEFORGE_API_KEY");
-        Environment.SetEnvironmentVariable("CURSEFORGE_API_KEY", "test-api-key");
+        Assert.False(handler.RequestConnectionClose.GetValueOrDefault());
+        Assert.Empty(handler.RequestConnectionHeaderValues);
+    }
 
-        try
+    private static void AssertNoConnectionHeader(SequencedHandler handler)
+    {
+        Assert.Equal(handler.RequestCount, handler.RequestConnectionCloseValues.Count);
+        Assert.Equal(handler.RequestCount, handler.RequestConnectionHeaderValues.Count);
+        Assert.All(handler.RequestConnectionCloseValues, static connectionClose => Assert.False(connectionClose.GetValueOrDefault()));
+
+        foreach (string[] connectionHeaderValues in handler.RequestConnectionHeaderValues)
+            Assert.Empty(connectionHeaderValues);
+    }
+
+    private static string[] GetHeaderValues(HttpRequestMessage request, string headerName)
+    {
+        return request.Headers.TryGetValues(headerName, out IEnumerable<string>? values) ? [.. values] : [];
+    }
+
+    private sealed class CapturingHandler : HttpMessageHandler
+    {
+        public HttpRequestMessage? Request { get; private set; }
+
+        public bool? RequestConnectionClose { get; private set; }
+
+        public string[] RequestConnectionHeaderValues { get; private set; } = [];
+
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
         {
-            var handler = new CapturingHandler();
-            using var factory = new WebApplicationFactory<Program>()
-                .WithWebHostBuilder(builder => builder.ConfigureTestServices(services =>
-                {
-                    services.AddSingleton<IHttpClientFactory>(new CapturingHttpClientFactory(handler));
-                }));
-            using var client = factory.CreateClient();
+            Request = request;
+            RequestConnectionClose = request.Headers.ConnectionClose;
+            RequestConnectionHeaderValues = GetHeaderValues(request, headerName: "Connection");
 
-            using var response = await client.GetAsync("/v1/mods/search?gameId=432&pageSize=10");
-
-            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-            Assert.NotNull(handler.Request);
-            Assert.Equal("/v1/mods/search", handler.Request.RequestUri?.AbsolutePath);
-            Assert.Equal("?gameId=432&pageSize=10", handler.Request.RequestUri?.Query);
-            Assert.Equal("api.curseforge.com", handler.Request.Headers.Host);
-        }
-        finally
-        {
-            Environment.SetEnvironmentVariable("CURSEFORGE_API_KEY", originalApiKey);
+            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent(content: "{}") });
         }
     }
 
@@ -491,119 +549,22 @@ public sealed class CurseForgeProxyTests
         }
     }
 
-    private sealed class CapturingHandler : HttpMessageHandler
-    {
-        public HttpRequestMessage? Request { get; private set; }
-
-        public bool? RequestConnectionClose { get; private set; }
-
-        public string[] RequestConnectionHeaderValues { get; private set; } = [];
-
-        protected override Task<HttpResponseMessage> SendAsync(
-            HttpRequestMessage request,
-            CancellationToken cancellationToken)
-        {
-            Request = request;
-            RequestConnectionClose = request.Headers.ConnectionClose;
-            RequestConnectionHeaderValues = GetHeaderValues(request, "Connection");
-
-            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
-            {
-                Content = new StringContent("{}")
-            });
-        }
-    }
-
-    private static void AssertNoConnectionHeader(CapturingHandler handler)
-    {
-        Assert.False(handler.RequestConnectionClose == true);
-        Assert.Empty(handler.RequestConnectionHeaderValues);
-    }
-
-    private static void AssertDistinctCloudFrontAddresses(SequencedHandler handler, int expectedCount)
-    {
-        Assert.Equal(expectedCount, handler.RequestUris.Count);
-        Assert.Equal(
-            expectedCount,
-            handler.RequestUris
-                .Select(uri => uri.Host)
-                .Distinct(StringComparer.OrdinalIgnoreCase)
-                .Count());
-    }
-
-    private static void AssertNoConnectionHeader(SequencedHandler handler)
-    {
-        Assert.Equal(handler.RequestCount, handler.RequestConnectionCloseValues.Count);
-        Assert.Equal(handler.RequestCount, handler.RequestConnectionHeaderValues.Count);
-        Assert.All(handler.RequestConnectionCloseValues, connectionClose => Assert.False(connectionClose == true));
-
-        foreach (var connectionHeaderValues in handler.RequestConnectionHeaderValues)
-            Assert.Empty(connectionHeaderValues);
-    }
-
-    private static string[] GetHeaderValues(HttpRequestMessage request, string headerName)
-    {
-        return request.Headers.TryGetValues(headerName, out var values) ? values.ToArray() : [];
-    }
-
-    private sealed class SequencedHandler : HttpMessageHandler
-    {
-        private readonly Queue<Func<HttpResponseMessage>> responsesQueue;
-
-        public SequencedHandler(params HttpResponseMessage[] responses)
-            : this(responses.Select<HttpResponseMessage, Func<HttpResponseMessage>>(response => () => response).ToArray())
-        {
-        }
-
-        public SequencedHandler(params Func<HttpResponseMessage>[] responses)
-        {
-            responsesQueue = new Queue<Func<HttpResponseMessage>>(responses);
-        }
-
-        public List<Uri> RequestUris { get; } = [];
-
-        public List<bool?> RequestConnectionCloseValues { get; } = [];
-
-        public List<string[]> RequestConnectionHeaderValues { get; } = [];
-
-        public int RequestCount { get; private set; }
-
-        protected override Task<HttpResponseMessage> SendAsync(
-            HttpRequestMessage request,
-            CancellationToken cancellationToken)
-        {
-            RequestCount++;
-            if (request.RequestUri is not null)
-                RequestUris.Add(request.RequestUri);
-
-            RequestConnectionCloseValues.Add(request.Headers.ConnectionClose);
-            RequestConnectionHeaderValues.Add(GetHeaderValues(request, "Connection"));
-
-            if (responsesQueue.Count == 0)
-                throw new InvalidOperationException("No more queued responses are available.");
-
-            return Task.FromResult(responsesQueue.Dequeue()());
-        }
-    }
-
     private sealed class CapturingLoggerProvider : ILoggerProvider
     {
-        private readonly ConcurrentQueue<LogEntry> entries = new();
+        private readonly ConcurrentQueue<LogEntry> _entries = new();
 
-        public IEnumerable<LogEntry> Entries => entries;
+        public IEnumerable<LogEntry> Entries => _entries;
 
         public ILogger CreateLogger(string categoryName)
         {
-            return new CapturingLogger(categoryName, entries);
+            return new CapturingLogger(categoryName, _entries);
         }
 
         public void Dispose()
         {
         }
 
-        private sealed class CapturingLogger(
-            string categoryName,
-            ConcurrentQueue<LogEntry> entries) : ILogger
+        private sealed class CapturingLogger(string categoryName, ConcurrentQueue<LogEntry> entries) : ILogger
         {
             public IDisposable? BeginScope<TState>(TState state) where TState : notnull
             {
@@ -615,12 +576,7 @@ public sealed class CurseForgeProxyTests
                 return true;
             }
 
-            public void Log<TState>(
-                LogLevel logLevel,
-                EventId eventId,
-                TState state,
-                Exception? exception,
-                Func<TState, Exception?, string> formatter)
+            public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter)
             {
                 entries.Enqueue(new LogEntry(categoryName, logLevel, exception, formatter(state, exception)));
             }
@@ -636,25 +592,69 @@ public sealed class CurseForgeProxyTests
         }
     }
 
-    private sealed record LogEntry(
-        string CategoryName,
-        LogLevel LogLevel,
-        Exception? Exception,
-        string Message);
+    private sealed record LogEntry(string CategoryName, LogLevel LogLevel, Exception? Exception, string Message);
+
+    private sealed class ProxyApplicationFactory(HttpMessageHandler handler, ILoggerProvider? loggerProvider = null) : WebApplicationFactory<Program>
+    {
+        protected override IHost CreateHost(IHostBuilder builder)
+        {
+            return base.CreateHost(builder.ConfigureServices(RegisterTestServices));
+        }
+
+        private void RegisterTestServices(IServiceCollection services)
+        {
+            services.Add(ServiceDescriptor.Singleton<IHttpClientFactory>(new CapturingHttpClientFactory(handler)));
+
+            if (loggerProvider is not null)
+                services.RemoveAll<ILoggerProvider>().Add(ServiceDescriptor.Singleton(loggerProvider));
+        }
+    }
+
+    private sealed class SequencedHandler(params Func<HttpResponseMessage>[] responses) : HttpMessageHandler
+    {
+        private readonly Queue<Func<HttpResponseMessage>> _responsesQueue = new(responses);
+
+        public SequencedHandler(params HttpResponseMessage[] responses)
+            : this(responses.Select<HttpResponseMessage, Func<HttpResponseMessage>>(response => () => response).ToArray())
+        {
+        }
+
+        public List<Uri> RequestUris { get; } = [];
+
+        public List<bool?> RequestConnectionCloseValues { get; } = [];
+
+        public int RequestCount { get; private set; }
+
+        public List<string[]> RequestConnectionHeaderValues { get; } = [];
+
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            RequestCount++;
+
+            if (request.RequestUri is not null)
+                RequestUris.Add(request.RequestUri);
+
+            RequestConnectionCloseValues.Add(request.Headers.ConnectionClose);
+            RequestConnectionHeaderValues.Add(GetHeaderValues(request, headerName: "Connection"));
+
+            return _responsesQueue.Count == 0
+                ? throw new InvalidOperationException(message: "No more queued responses are available.")
+                : Task.FromResult(_responsesQueue.Dequeue()());
+        }
+    }
 
     private sealed class TimeoutHandler : HttpMessageHandler
     {
-        protected override Task<HttpResponseMessage> SendAsync(
-            HttpRequestMessage request,
-            CancellationToken cancellationToken)
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
         {
             return WaitForTimeoutAsync(cancellationToken);
         }
 
         private static async Task<HttpResponseMessage> WaitForTimeoutAsync(CancellationToken cancellationToken)
         {
-            await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
-            throw new InvalidOperationException("Timeout handler should only complete by cancellation.");
+            await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken).ConfigureAwait(continueOnCapturedContext: false);
+
+            throw new InvalidOperationException(message: "Timeout handler should only complete by cancellation.");
         }
     }
 }

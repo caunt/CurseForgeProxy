@@ -1,34 +1,32 @@
 using CurseForgeProxy;
 
-var builder = WebApplication.CreateBuilder(args);
+using Egress;
 
-builder.Logging.SetMinimumLevel(LogLevel.Warning);
+WebApplicationBuilder builder = WebApplication.CreateBuilder(args);
 
-builder.Logging.AddFilter(nameof(CurseForgeProxy), LogLevel.Debug);
-builder.Logging.AddFilter(nameof(Egress), LogLevel.Debug);
+ILoggingBuilder logging = builder.Logging
+    .SetMinimumLevel(LogLevel.Warning)
+    .AddFilter(nameof(CurseForgeProxy), LogLevel.Debug)
+    .AddFilter(nameof(Egress), LogLevel.Debug);
 
-builder.Services.AddSingleton<EnvironmentConfiguration>();
-builder.Services.AddSingleton<CurseForgeEndpoints>();
-
-builder.Services
-    .AddEgressPool(options =>
-    {
-        options.AddressMode = Egress.EgressAddressMode.AssignOnDemand;
-    })
+IServiceCollection services = logging.Services
+    .AddEgressPool(static options => options.AddressMode = EgressAddressMode.AssignOnDemand)
     .AddHttpClient(name: CurseForgeEndpoints.HttpClientName)
-    .ConfigurePrimaryHttpMessageHandler(serviceProvider =>
-    {
-        var handler = serviceProvider.GetRequiredService<Egress.EgressPool>().CreateHttpMessageHandler();
-        handler.AllowAutoRedirect = false;
-        return handler;
-    });
+    .ConfigurePrimaryHttpMessageHandler(
+        static serviceProvider =>
+        {
+            SocketsHttpHandler handler = serviceProvider.GetRequiredService<EgressPool>().CreateHttpMessageHandler();
+            handler.AllowAutoRedirect = false;
 
-var app = builder.Build();
+            return handler;
+        }
+    )
+    .Services;
 
-app.Services
-    .GetRequiredService<CurseForgeEndpoints>()
-    .ConfigureRoutes(app);
+services.Add(ServiceDescriptor.Singleton<EnvironmentConfiguration, EnvironmentConfiguration>());
+services.Add(ServiceDescriptor.Singleton<CurseForgeEndpoints, CurseForgeEndpoints>());
 
+WebApplication app = builder.Build();
+
+app.Services.GetRequiredService<CurseForgeEndpoints>().ConfigurePipeline(app);
 app.Run();
-
-public partial class Program;

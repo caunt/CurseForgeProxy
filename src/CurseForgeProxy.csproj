@@ -8,7 +8,11 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="EgressPool.DependencyInjection" Version="26.10.13.8169" />
+    <PackageReference Include="EgressPool.DependencyInjection" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="CurseForgeProxy.Tests" />
   </ItemGroup>
 
 </Project>
