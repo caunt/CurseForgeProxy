@@ -16,8 +16,11 @@ internal sealed partial class CurseForgeEndpoints(EnvironmentConfiguration confi
 
     private const string ApiCurseForgeHost = "api.curseforge.com";
     private const string ApiKeyHeaderName = "x-api-key";
+    private const int MaximumConnectionsPerServer = 32;
     private const string WwwCurseForgeHost = "www.curseforge.com";
     private static readonly TimeSpan UpstreamAttemptTimeout = TimeSpan.FromSeconds(seconds: 5);
+    private static readonly TimeSpan UpstreamConnectionIdleTimeout = TimeSpan.FromMinutes(minutes: 5);
+    private static readonly TimeSpan UpstreamConnectionLifetime = TimeSpan.FromMinutes(minutes: 10);
 
     private static readonly IPAddress[] CloudFrontAddresses =
     [
@@ -46,6 +49,16 @@ internal sealed partial class CurseForgeEndpoints(EnvironmentConfiguration confi
     // Matches /v1/mods/{modId}/files/{fileId}/download
     [GeneratedRegex(@"^/v1/mods/\d+/files/\d+/download$", RegexOptions.IgnoreCase)]
     private static partial Regex FallbackDownloadPathPattern { get; }
+
+    public static void ConfigureUpstreamHandler(SocketsHttpHandler handler)
+    {
+        handler.AllowAutoRedirect = false;
+        handler.ConnectTimeout = UpstreamAttemptTimeout;
+        handler.MaxConnectionsPerServer = MaximumConnectionsPerServer;
+        handler.PlaintextStreamFilter = UpstreamConnectionStream.WrapAsync;
+        handler.PooledConnectionIdleTimeout = UpstreamConnectionIdleTimeout;
+        handler.PooledConnectionLifetime = UpstreamConnectionLifetime;
+    }
 
     public void ConfigurePipeline(IApplicationBuilder application)
     {
@@ -200,7 +213,7 @@ internal sealed partial class CurseForgeEndpoints(EnvironmentConfiguration confi
 
     [LoggerMessage(
         Level = LogLevel.Debug,
-        Message = "Upstream request attempt {Attempt}/{MaximumAttempts} to {TargetHost} via {CloudFrontAddress} timed out."
+        Message = "Upstream request attempt {Attempt}/{MaximumAttempts} to {TargetHost} via {CloudFrontAddress} timed out waiting for the upstream response."
     )]
     private static partial void LogAttemptTimedOut(ILogger logger, int attempt, int maximumAttempts, string? targetHost, IPAddress cloudFrontAddress);
 
@@ -229,6 +242,12 @@ internal sealed partial class CurseForgeEndpoints(EnvironmentConfiguration confi
         string? targetHost,
         IPAddress cloudFrontAddress
     );
+
+    [LoggerMessage(
+        Level = LogLevel.Warning,
+        Message = "Upstream request attempt {Attempt}/{MaximumAttempts} to {TargetHost} via {CloudFrontAddress} timed out waiting for an upstream connection."
+    )]
+    private static partial void LogConnectionWaitTimedOut(ILogger logger, int attempt, int maximumAttempts, string? targetHost, IPAddress cloudFrontAddress);
 
     [LoggerMessage(
         Level = LogLevel.Debug,
@@ -364,6 +383,8 @@ internal sealed partial class CurseForgeEndpoints(EnvironmentConfiguration confi
 
             attemptTimeout.CancelAfter(UpstreamAttemptTimeout);
 
+            UpstreamAttempt upstreamAttempt = UpstreamAttempt.Start();
+
             try
             {
                 proxyResponse = await httpClient
@@ -376,7 +397,10 @@ internal sealed partial class CurseForgeEndpoints(EnvironmentConfiguration confi
             }
             catch (OperationCanceledException) when (!context.RequestAborted.IsCancellationRequested)
             {
-                LogAttemptTimedOut(logger, attempt, maximumAttempts, proxyRequest.Headers.Host, cloudFrontAddress);
+                if (upstreamAttempt.HasConnection)
+                    LogAttemptTimedOut(logger, attempt, maximumAttempts, proxyRequest.Headers.Host, cloudFrontAddress);
+                else
+                    LogConnectionWaitTimedOut(logger, attempt, maximumAttempts, proxyRequest.Headers.Host, cloudFrontAddress);
 
                 context.Response.StatusCode = StatusCodes.Status504GatewayTimeout;
                 await context.Response

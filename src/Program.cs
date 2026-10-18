@@ -16,7 +16,7 @@ IServiceCollection services = logging.Services
         static serviceProvider =>
         {
             SocketsHttpHandler handler = serviceProvider.GetRequiredService<EgressPool>().CreateHttpMessageHandler();
-            handler.AllowAutoRedirect = false;
+            CurseForgeEndpoints.ConfigureUpstreamHandler(handler);
 
             return handler;
         }
