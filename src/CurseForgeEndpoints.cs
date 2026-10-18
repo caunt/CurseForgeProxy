@@ -10,25 +10,21 @@ using Microsoft.Net.Http.Headers;
 
 namespace CurseForgeProxy;
 
-internal sealed partial class CurseForgeEndpoints(EnvironmentConfiguration configuration, IHttpClientFactory httpClientFactory, ILogger<CurseForgeEndpoints> logger)
+internal sealed partial class CurseForgeEndpoints(
+    EnvironmentConfiguration configuration,
+    IHttpClientFactory httpClientFactory,
+    CloudFrontAddressSelector addressSelector,
+    ILogger<CurseForgeEndpoints> logger
+)
 {
     public const string HttpClientName = "curseforge-egress";
 
     private const string ApiCurseForgeHost = "api.curseforge.com";
     private const string ApiKeyHeaderName = "x-api-key";
-    private const int MaximumConnectionsPerServer = 32;
     private const string WwwCurseForgeHost = "www.curseforge.com";
     private static readonly TimeSpan UpstreamAttemptTimeout = TimeSpan.FromSeconds(seconds: 5);
     private static readonly TimeSpan UpstreamConnectionIdleTimeout = TimeSpan.FromMinutes(minutes: 5);
     private static readonly TimeSpan UpstreamConnectionLifetime = TimeSpan.FromMinutes(minutes: 10);
-
-    private static readonly IPAddress[] CloudFrontAddresses =
-    [
-        IPAddress.Parse(ipString: "2600:f0f0:601::"), // AWS AMAZON, GLOBAL
-        IPAddress.Parse(ipString: "2600:f0f0:602::"), // AWS AMAZON, GLOBAL
-        IPAddress.Parse(ipString: "2600:f0f0:603::"), // AWS AMAZON, GLOBAL
-        IPAddress.Parse(ipString: "2600:9000:2000::") // CloudFront / AWS global edge range
-    ];
 
     private static readonly HashSet<string> HopByHopHeaders = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -44,8 +40,6 @@ internal sealed partial class CurseForgeEndpoints(EnvironmentConfiguration confi
         "Upgrade"
     };
 
-    private static int s_nextCloudFrontAddressIndex;
-
     // Matches /v1/mods/{modId}/files/{fileId}/download
     [GeneratedRegex(@"^/v1/mods/\d+/files/\d+/download$", RegexOptions.IgnoreCase)]
     private static partial Regex FallbackDownloadPathPattern { get; }
@@ -54,7 +48,7 @@ internal sealed partial class CurseForgeEndpoints(EnvironmentConfiguration confi
     {
         handler.AllowAutoRedirect = false;
         handler.ConnectTimeout = UpstreamAttemptTimeout;
-        handler.MaxConnectionsPerServer = MaximumConnectionsPerServer;
+        handler.MaxConnectionsPerServer = CloudFrontAddressSelector.MaximumConnectionsPerAddress;
         handler.PlaintextStreamFilter = UpstreamConnectionStream.WrapAsync;
         handler.PooledConnectionIdleTimeout = UpstreamConnectionIdleTimeout;
         handler.PooledConnectionLifetime = UpstreamConnectionLifetime;
@@ -119,13 +113,6 @@ internal sealed partial class CurseForgeEndpoints(EnvironmentConfiguration confi
         {
             return Encoding.UTF8.GetString(responseBody);
         }
-    }
-
-    private static int GetCloudFrontStartIndex()
-    {
-        int index = Interlocked.Increment(ref s_nextCloudFrontAddressIndex) - 1;
-
-        return PositiveModulo(index, CloudFrontAddresses.Length);
     }
 
     private static bool HasSocketError(Exception exception, SocketError socketError)
@@ -291,13 +278,6 @@ internal sealed partial class CurseForgeEndpoints(EnvironmentConfiguration confi
         IPAddress cloudFrontAddress
     );
 
-    private static int PositiveModulo(int value, int divisor)
-    {
-        int result = value % divisor;
-
-        return result < 0 ? result + divisor : result;
-    }
-
     private static UpstreamTarget ResolveTarget(HttpRequest request)
     {
         string requestPath = request.Path.HasValue ? request.Path.Value : "/";
@@ -305,13 +285,6 @@ internal sealed partial class CurseForgeEndpoints(EnvironmentConfiguration confi
         return FallbackDownloadPathPattern.IsMatch(requestPath)
             ? new UpstreamTarget(WwwCurseForgeHost, "/api" + requestPath)
             : new UpstreamTarget(ApiCurseForgeHost, requestPath);
-    }
-
-    private static IPAddress SelectCloudFrontAddress(int startIndex, int attempt)
-    {
-        int index = (startIndex + attempt - 1) % CloudFrontAddresses.Length;
-
-        return CloudFrontAddresses[index];
     }
 
     private void CopyRequestHeaders(HttpRequest request, HttpRequestMessage proxyRequest)
@@ -367,11 +340,16 @@ internal sealed partial class CurseForgeEndpoints(EnvironmentConfiguration confi
 
         const int maximumAttempts = 3;
         HttpClient httpClient = httpClientFactory.CreateClient(HttpClientName);
-        int cloudFrontStartIndex = GetCloudFrontStartIndex();
+        int cloudFrontStartIndex = addressSelector.NextStartIndex();
+        List<IPAddress> triedAddresses = new(maximumAttempts);
 
         for (int attempt = 1; attempt <= maximumAttempts; attempt++)
         {
-            IPAddress cloudFrontAddress = SelectCloudFrontAddress(cloudFrontStartIndex, attempt);
+            using CloudFrontAddressSelector.AddressLease addressLease = addressSelector.Acquire(cloudFrontStartIndex, triedAddresses);
+
+            IPAddress cloudFrontAddress = addressLease.Address;
+
+            triedAddresses.Add(cloudFrontAddress);
 
             using HttpRequestMessage proxyRequest = CreateProxyRequest(context, cloudFrontAddress);
 
@@ -456,6 +434,8 @@ internal sealed partial class CurseForgeEndpoints(EnvironmentConfiguration confi
 
                 if (isRetryableForbiddenResponse)
                 {
+                    addressLease.RecordBlocked();
+
                     if (attempt < maximumAttempts)
                     {
                         LogStatusRetrying(logger, statusCode, attempt, maximumAttempts, proxyRequest.Headers.Host, cloudFrontAddress);

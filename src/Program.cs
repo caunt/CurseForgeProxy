@@ -2,6 +2,8 @@ using CurseForgeProxy;
 
 using Egress;
 
+using Microsoft.Extensions.DependencyInjection.Extensions;
+
 WebApplicationBuilder builder = WebApplication.CreateBuilder(args);
 
 ILoggingBuilder logging = builder.Logging
@@ -31,7 +33,9 @@ IServiceCollection services = logging.Services
     )
     .Services;
 
+services.TryAddSingleton(TimeProvider.System);
 services.Add(ServiceDescriptor.Singleton<EnvironmentConfiguration, EnvironmentConfiguration>());
+services.Add(ServiceDescriptor.Singleton<CloudFrontAddressSelector, CloudFrontAddressSelector>());
 services.Add(ServiceDescriptor.Singleton<CurseForgeEndpoints, CurseForgeEndpoints>());
 
 WebApplication app = builder.Build();
