@@ -7,7 +7,9 @@ using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Http;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 
 namespace CurseForgeProxy.Tests;
 
@@ -153,6 +155,21 @@ public sealed class CurseForgeProxyTests
         {
             Environment.SetEnvironmentVariable(variable: "CURSEFORGE_API_KEY", originalApiKey);
         }
+    }
+
+    /// <summary>
+    /// The client factory never retires the upstream handler, so its connection pool lives as long as the process and only PooledConnectionLifetime rotates connections.
+    /// </summary>
+    [Fact]
+    public void CurseForgeProxyKeepsUpstreamHandlerForProcessLifetime()
+    {
+        using WebApplicationFactory<Program> factory = new();
+
+        HttpClientFactoryOptions options = factory.Services
+            .GetRequiredService<IOptionsMonitor<HttpClientFactoryOptions>>()
+            .Get(CurseForgeEndpoints.HttpClientName);
+
+        Assert.Equal(Timeout.InfiniteTimeSpan, options.HandlerLifetime);
     }
 
     /// <summary>

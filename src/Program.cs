@@ -10,8 +10,16 @@ ILoggingBuilder logging = builder.Logging
     .AddFilter(nameof(Egress), LogLevel.Debug);
 
 IServiceCollection services = logging.Services
-    .AddEgressPool(static options => options.AddressMode = EgressAddressMode.AssignOnDemand)
+    .AddEgressPool(
+        static options =>
+        {
+            options.AddressMode = EgressAddressMode.AssignOnDemand;
+            options.SpareAddressCount = 32;
+            options.NewAddressRateLimit = 50;
+        }
+    )
     .AddHttpClient(name: CurseForgeEndpoints.HttpClientName)
+    .SetHandlerLifetime(Timeout.InfiniteTimeSpan)
     .ConfigurePrimaryHttpMessageHandler(
         static serviceProvider =>
         {
