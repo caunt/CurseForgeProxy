@@ -312,6 +312,58 @@ public sealed class CurseForgeProxyTests
     }
 
     /// <summary>
+    /// An edge address that never completes the TCP handshake fails the attempt at the connect timeout instead of the attempt timeout,
+    /// the request is retried on another address, and new attempts avoid the unreachable address.
+    /// </summary>
+    [Fact]
+    public async Task CurseForgeProxyRetriesConnectTimeoutsOnDifferentCloudFrontAddresses()
+    {
+        string? originalApiKey = Environment.GetEnvironmentVariable(variable: "CURSEFORGE_API_KEY");
+        Environment.SetEnvironmentVariable(variable: "CURSEFORGE_API_KEY", value: "test-api-key");
+
+        try
+        {
+            using CapturingLoggerProvider loggerProvider = new();
+
+            using ConnectTimeoutHandler handler = new(unreachableAttempts: 1);
+
+            using ProxyApplicationFactory factory = new(handler, loggerProvider);
+
+            using HttpClient client = factory.CreateClient();
+
+            using HttpResponseMessage response = await client.GetAsync(new Uri(uriString: "/v1/mods/search", UriKind.Relative));
+
+            string body = await response.Content.ReadAsStringAsync();
+
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            Assert.Equal(expected: "{}", body);
+            Assert.Equal(expected: 2, handler.RequestUris.Count);
+            Assert.Equal(expected: 2, handler.RequestUris.Select(static uri => uri.Host).Distinct(StringComparer.OrdinalIgnoreCase).Count());
+
+            IPAddress unreachableAddress = IPAddress.Parse(handler.RequestUris[index: 0].IdnHost);
+            CloudFrontAddressSelector selector = factory.Services.GetRequiredService<CloudFrontAddressSelector>();
+
+            for (int startIndex = 0; startIndex < CloudFrontAddressSelector.AddressCount; startIndex++)
+            {
+                using CloudFrontAddressSelector.AddressLease lease = selector.Acquire(startIndex, []);
+
+                Assert.NotEqual(unreachableAddress, lease.Address);
+            }
+
+            Assert.Contains(
+                loggerProvider.Entries,
+                static entry => entry.CategoryName == typeof(CloudFrontAddressSelector).FullName
+                    && entry.LogLevel == LogLevel.Warning
+                    && entry.Message.Contains(value: "is not accepting connections", StringComparison.Ordinal)
+            );
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(variable: "CURSEFORGE_API_KEY", originalApiKey);
+        }
+    }
+
+    /// <summary>
     /// A connection reset on the first edge address is retried once on another address before the response is returned.
     /// </summary>
     [Fact]
@@ -443,6 +495,38 @@ public sealed class CurseForgeProxyTests
                     && entry.Exception is SocketException
                     && entry.Message.Contains(value: "Upstream request failed after connection failure on attempt 3/3", StringComparison.Ordinal)
             );
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(variable: "CURSEFORGE_API_KEY", originalApiKey);
+        }
+    }
+
+    /// <summary>
+    /// When every attempt runs out the connect timeout, the caller gets 504 Gateway Timeout that names the connection.
+    /// </summary>
+    [Fact]
+    public async Task CurseForgeProxyReturnsGatewayTimeoutForConnectTimeoutAfterMaximumRetries()
+    {
+        string? originalApiKey = Environment.GetEnvironmentVariable(variable: "CURSEFORGE_API_KEY");
+        Environment.SetEnvironmentVariable(variable: "CURSEFORGE_API_KEY", value: "test-api-key");
+
+        try
+        {
+            using ConnectTimeoutHandler handler = new(unreachableAttempts: 3);
+
+            using ProxyApplicationFactory factory = new(handler);
+
+            using HttpClient client = factory.CreateClient();
+
+            using HttpResponseMessage response = await client.GetAsync(new Uri(uriString: "/v1/mods/search", UriKind.Relative));
+
+            string body = await response.Content.ReadAsStringAsync();
+
+            Assert.Equal(HttpStatusCode.GatewayTimeout, response.StatusCode);
+            Assert.Equal(expected: "Upstream connection timed out.", body);
+            Assert.Equal(expected: 3, handler.RequestUris.Count);
+            Assert.Equal(expected: 3, handler.RequestUris.Select(static uri => uri.Host).Distinct(StringComparer.OrdinalIgnoreCase).Count());
         }
         finally
         {
@@ -606,6 +690,50 @@ public sealed class CurseForgeProxyTests
             public void Dispose()
             {
             }
+        }
+    }
+
+    private sealed class ConnectTimeoutHandler(int unreachableAttempts) : HttpMessageHandler
+    {
+        private readonly HttpMessageInvoker _reachableUpstream = new(new CapturingHandler(), disposeHandler: true);
+
+        private readonly HttpMessageInvoker _unreachableUpstream = new(
+            new SocketsHttpHandler
+            {
+                ConnectCallback = NeverConnectAsync,
+                ConnectTimeout = TimeSpan.FromMilliseconds(milliseconds: 100)
+            },
+            disposeHandler: true
+        );
+
+        public List<Uri> RequestUris { get; } = [];
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                _reachableUpstream.Dispose();
+                _unreachableUpstream.Dispose();
+            }
+
+            base.Dispose(disposing);
+        }
+
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            if (request.RequestUri is not null)
+                RequestUris.Add(request.RequestUri);
+
+            HttpMessageInvoker upstream = RequestUris.Count <= unreachableAttempts ? _unreachableUpstream : _reachableUpstream;
+
+            return upstream.SendAsync(request, cancellationToken);
+        }
+
+        private static async ValueTask<Stream> NeverConnectAsync(SocketsHttpConnectionContext context, CancellationToken cancellationToken)
+        {
+            await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken).ConfigureAwait(continueOnCapturedContext: false);
+
+            throw new InvalidOperationException($"The connection to {context.DnsEndPoint} should only end by the connect timeout.");
         }
     }
 

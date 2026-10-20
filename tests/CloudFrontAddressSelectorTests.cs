@@ -26,11 +26,40 @@ public sealed class CloudFrontAddressSelectorTests
             Assert.NotEqual(blockedAddress, lease.Address);
         }
 
-        timeProvider.Advance(CloudFrontAddressSelector.BlockedAddressCooldown);
+        timeProvider.Advance(CloudFrontAddressSelector.AddressCooldown);
 
         using CloudFrontAddressSelector.AddressLease recoveredLease = selector.Acquire(startIndex: 0, []);
 
         Assert.Equal(blockedAddress, recoveredLease.Address);
+    }
+
+    /// <summary>
+    /// After a connection failure, as in issue #105, the address is avoided for the cool-down, then takes one probe at a time until an attempt there gets a response.
+    /// </summary>
+    [Fact]
+    public void CloudFrontAddressSelectorProbesUnreachableAddressOneAttemptAtATime()
+    {
+        ManualTimeProvider timeProvider = new();
+        CloudFrontAddressSelector selector = new(timeProvider, NullLogger<CloudFrontAddressSelector>.Instance);
+        IPAddress unreachableAddress = AcquireAndFailConnection(selector, startIndex: 0);
+
+        using (CloudFrontAddressSelector.AddressLease coolingLease = selector.Acquire(startIndex: 0, []))
+            Assert.NotEqual(unreachableAddress, coolingLease.Address);
+
+        timeProvider.Advance(CloudFrontAddressSelector.AddressCooldown);
+
+        using CloudFrontAddressSelector.AddressLease probeLease = selector.Acquire(startIndex: 0, []);
+
+        Assert.Equal(unreachableAddress, probeLease.Address);
+
+        using (CloudFrontAddressSelector.AddressLease concurrentLease = selector.Acquire(startIndex: 0, []))
+            Assert.NotEqual(unreachableAddress, concurrentLease.Address);
+
+        probeLease.RecordResponse();
+
+        using CloudFrontAddressSelector.AddressLease recoveredLease = selector.Acquire(startIndex: 0, []);
+
+        Assert.Equal(unreachableAddress, recoveredLease.Address);
     }
 
     /// <summary>
@@ -97,6 +126,15 @@ public sealed class CloudFrontAddressSelectorTests
         using CloudFrontAddressSelector.AddressLease lease = selector.Acquire(startIndex, []);
 
         lease.RecordBlocked();
+
+        return lease.Address;
+    }
+
+    private static IPAddress AcquireAndFailConnection(CloudFrontAddressSelector selector, int startIndex)
+    {
+        using CloudFrontAddressSelector.AddressLease lease = selector.Acquire(startIndex, []);
+
+        lease.RecordConnectionFailure();
 
         return lease.Address;
     }

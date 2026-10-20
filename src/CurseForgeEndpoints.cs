@@ -26,6 +26,10 @@ internal sealed partial class CurseForgeEndpoints(
     private static readonly TimeSpan UpstreamConnectionIdleTimeout = TimeSpan.FromMinutes(minutes: 5);
     private static readonly TimeSpan UpstreamConnectionLifetime = TimeSpan.FromMinutes(minutes: 10);
 
+    // Shorter than an attempt, so an edge that drops SYNs fails the connect and is retried elsewhere, but longer than
+    // EgressPool's two-second warm-up of a new source address, which runs inside the connect.
+    private static readonly TimeSpan UpstreamConnectTimeout = TimeSpan.FromSeconds(seconds: 3);
+
     private static readonly HashSet<string> HopByHopHeaders = new(StringComparer.OrdinalIgnoreCase)
     {
         "Connection",
@@ -47,7 +51,7 @@ internal sealed partial class CurseForgeEndpoints(
     public static void ConfigureUpstreamHandler(SocketsHttpHandler handler)
     {
         handler.AllowAutoRedirect = false;
-        handler.ConnectTimeout = UpstreamAttemptTimeout;
+        handler.ConnectTimeout = UpstreamConnectTimeout;
         handler.MaxConnectionsPerServer = CloudFrontAddressSelector.MaximumConnectionsPerAddress;
         handler.PlaintextStreamFilter = UpstreamConnectionStream.WrapAsync;
         handler.PooledConnectionIdleTimeout = UpstreamConnectionIdleTimeout;
@@ -138,6 +142,11 @@ internal sealed partial class CurseForgeEndpoints(
             body.Contains(value: "Request blocked", StringComparison.OrdinalIgnoreCase) &&
             body.Contains(value: "There might be too much traffic or a configuration error", StringComparison.OrdinalIgnoreCase) &&
             body.Contains(value: "CloudFront", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsConnectTimeout(Exception exception)
+    {
+        return exception is OperationCanceledException { InnerException: TimeoutException };
     }
 
     private static bool IsConnectionReset(Exception exception)
@@ -373,7 +382,38 @@ internal sealed partial class CurseForgeEndpoints(
             {
                 return;
             }
-            catch (OperationCanceledException) when (!context.RequestAborted.IsCancellationRequested)
+            catch (Exception exception) when (IsConnectTimeout(exception) || IsRetryableConnectionFailure(exception))
+            {
+                if (!upstreamAttempt.HasConnection)
+                    addressLease.RecordConnectionFailure();
+
+                if (attempt < maximumAttempts)
+                {
+                    LogConnectionFailureRetrying(logger, exception, attempt, maximumAttempts, proxyRequest.Headers.Host, cloudFrontAddress);
+
+                    continue;
+                }
+
+                LogConnectionFailureExhausted(logger, exception, attempt, maximumAttempts, proxyRequest.Headers.Host, cloudFrontAddress);
+
+                if (IsConnectTimeout(exception))
+                {
+                    context.Response.StatusCode = StatusCodes.Status504GatewayTimeout;
+                    await context.Response
+                        .WriteAsync(text: "Upstream connection timed out.", context.RequestAborted)
+                        .ConfigureAwait(continueOnCapturedContext: false);
+
+                    return;
+                }
+
+                string failureMessage = IsConnectionReset(exception) ? "Upstream connection was reset." : "Upstream connection failed.";
+
+                context.Response.StatusCode = StatusCodes.Status502BadGateway;
+                await context.Response.WriteAsync(failureMessage, context.RequestAborted).ConfigureAwait(continueOnCapturedContext: false);
+
+                return;
+            }
+            catch (OperationCanceledException)
             {
                 if (upstreamAttempt.HasConnection)
                     LogAttemptTimedOut(logger, attempt, maximumAttempts, proxyRequest.Headers.Host, cloudFrontAddress);
@@ -384,24 +424,6 @@ internal sealed partial class CurseForgeEndpoints(
                 await context.Response
                     .WriteAsync(text: "Upstream request timed out.", context.RequestAborted)
                     .ConfigureAwait(continueOnCapturedContext: false);
-
-                return;
-            }
-            catch (Exception exception) when (IsRetryableConnectionFailure(exception))
-            {
-                if (attempt < maximumAttempts)
-                {
-                    LogConnectionFailureRetrying(logger, exception, attempt, maximumAttempts, proxyRequest.Headers.Host, cloudFrontAddress);
-
-                    continue;
-                }
-
-                LogConnectionFailureExhausted(logger, exception, attempt, maximumAttempts, proxyRequest.Headers.Host, cloudFrontAddress);
-
-                string failureMessage = IsConnectionReset(exception) ? "Upstream connection was reset." : "Upstream connection failed.";
-
-                context.Response.StatusCode = StatusCodes.Status502BadGateway;
-                await context.Response.WriteAsync(failureMessage, context.RequestAborted).ConfigureAwait(continueOnCapturedContext: false);
 
                 return;
             }
@@ -416,6 +438,8 @@ internal sealed partial class CurseForgeEndpoints(
 
                 return;
             }
+
+            addressLease.RecordResponse();
 
             using (proxyResponse)
             {

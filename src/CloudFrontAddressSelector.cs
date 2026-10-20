@@ -5,18 +5,20 @@ namespace CurseForgeProxy;
 
 /// <summary>
 /// Chooses the CloudFront edge address for each upstream attempt, steering attempts away from addresses that recently answered
-/// "Request blocked" and from addresses whose connection pool is already full.
+/// "Request blocked" or failed to connect, and from addresses whose connection pool is already full.
 /// </summary>
 /// <remarks>
 /// A full pool queues requests toward the attempt timeout, which ends in a 504 that is never retried, while a blocking address
 /// answers quickly with a 403 that is retried elsewhere. Untried addresses therefore rank as: available, cooling down, full,
 /// then both; ties keep the request's rotation order, and among cooling addresses the one that recovers first wins.
+/// An address that failed to connect counts as full with a single attempt in flight until an attempt there gets a response,
+/// so once its cool-down ends it is probed one attempt at a time instead of taking its share of the rotation.
 /// </remarks>
 internal sealed partial class CloudFrontAddressSelector(TimeProvider timeProvider, ILogger<CloudFrontAddressSelector> logger)
 {
     public const int MaximumConnectionsPerAddress = 32;
 
-    public static readonly TimeSpan BlockedAddressCooldown = TimeSpan.FromSeconds(seconds: 30);
+    public static readonly TimeSpan AddressCooldown = TimeSpan.FromSeconds(seconds: 30);
 
     private static readonly IPAddress[] Addresses =
     [
@@ -28,6 +30,7 @@ internal sealed partial class CloudFrontAddressSelector(TimeProvider timeProvide
 
     private readonly int[] _activeAttempts = new int[Addresses.Length];
     private readonly long[] _blockedAttempts = new long[Addresses.Length];
+    private readonly int[] _connectionFailureStreaks = new int[Addresses.Length];
     private readonly long[] _cooldownEnds = new long[Addresses.Length];
     private int _nextStartIndex;
 
@@ -57,14 +60,37 @@ internal sealed partial class CloudFrontAddressSelector(TimeProvider timeProvide
     )]
     private static partial void LogAddressBlocked(ILogger logger, IPAddress cloudFrontAddress, long blockedAttempts, double cooldownSeconds);
 
+    [LoggerMessage(Level = LogLevel.Information, Message = "CloudFront address {CloudFrontAddress} is responding again after {ConnectionFailures} failed connection attempts.")]
+    private static partial void LogAddressRecovered(ILogger logger, IPAddress cloudFrontAddress, int connectionFailures);
+
+    [LoggerMessage(
+        Level = LogLevel.Warning,
+        Message = "CloudFront address {CloudFrontAddress} is not accepting connections ({ConnectionFailures} failed connection attempts since its last response); new attempts avoid it for {CooldownSeconds} s, then probe it one at a time until it responds."
+    )]
+    private static partial void LogAddressUnreachable(ILogger logger, IPAddress cloudFrontAddress, int connectionFailures, double cooldownSeconds);
+
     private void RecordBlocked(int index)
     {
-        DateTimeOffset now = timeProvider.GetUtcNow();
         long blockedAttempts = Interlocked.Increment(ref _blockedAttempts[index]);
-        long previousCooldownEnd = Interlocked.Exchange(ref _cooldownEnds[index], (now + BlockedAddressCooldown).UtcTicks);
 
-        if (previousCooldownEnd <= now.UtcTicks)
-            LogAddressBlocked(logger, Addresses[index], blockedAttempts, BlockedAddressCooldown.TotalSeconds);
+        if (StartCooldown(index))
+            LogAddressBlocked(logger, Addresses[index], blockedAttempts, AddressCooldown.TotalSeconds);
+    }
+
+    private void RecordConnectionFailure(int index)
+    {
+        int connectionFailures = Interlocked.Increment(ref _connectionFailureStreaks[index]);
+
+        if (StartCooldown(index))
+            LogAddressUnreachable(logger, Addresses[index], connectionFailures, AddressCooldown.TotalSeconds);
+    }
+
+    private void RecordResponse(int index)
+    {
+        int connectionFailures = Interlocked.Exchange(ref _connectionFailureStreaks[index], value: 0);
+
+        if (connectionFailures > 0)
+            LogAddressRecovered(logger, Addresses[index], connectionFailures);
     }
 
     private void Release(int index)
@@ -90,7 +116,8 @@ internal sealed partial class CloudFrontAddressSelector(TimeProvider timeProvide
 
             long cooldownEnd = Volatile.Read(ref _cooldownEnds[index]);
             bool isCoolingDown = cooldownEnd > now;
-            bool isFull = Volatile.Read(ref _activeAttempts[index]) >= MaximumConnectionsPerAddress;
+            int capacity = Volatile.Read(ref _connectionFailureStreaks[index]) > 0 ? 1 : MaximumConnectionsPerAddress;
+            bool isFull = Volatile.Read(ref _activeAttempts[index]) >= capacity;
             int rank = (isFull ? 2 : 0) + (isCoolingDown ? 1 : 0);
             bool recoversSooner = rank == selectedRank && isCoolingDown && cooldownEnd < selectedCooldownEnd;
 
@@ -103,6 +130,14 @@ internal sealed partial class CloudFrontAddressSelector(TimeProvider timeProvide
         }
 
         return selectedIndex;
+    }
+
+    private bool StartCooldown(int index)
+    {
+        DateTimeOffset now = timeProvider.GetUtcNow();
+        long previousCooldownEnd = Interlocked.Exchange(ref _cooldownEnds[index], (now + AddressCooldown).UtcTicks);
+
+        return previousCooldownEnd <= now.UtcTicks;
     }
 
     /// <summary>
@@ -120,6 +155,16 @@ internal sealed partial class CloudFrontAddressSelector(TimeProvider timeProvide
         public void RecordBlocked()
         {
             selector.RecordBlocked(index);
+        }
+
+        public void RecordConnectionFailure()
+        {
+            selector.RecordConnectionFailure(index);
+        }
+
+        public void RecordResponse()
+        {
+            selector.RecordResponse(index);
         }
     }
 }
