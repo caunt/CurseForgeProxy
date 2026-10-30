@@ -5,7 +5,7 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <GlobalPackageReference Include="NetAgents.Analyzers" Version="26.10.26.2518" />
+    <GlobalPackageReference Include="NetAgents.Analyzers" Version="26.10.30.6264" />
   </ItemGroup>
 
   <ItemGroup>
